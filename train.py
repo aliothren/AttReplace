@@ -7,11 +7,42 @@ import datetime
 
 import utils
 
-from typing import Iterable, Optional
+from typing import Iterable
+from timm.utils import accuracy
 
 
-def evaluate():
-    ...
+@torch.no_grad()
+def evaluate(data_loader, model, device):
+    criterion = torch.nn.CrossEntropyLoss()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+
+    # switch to evaluation mode
+    model.eval()
+
+    for images, target in metric_logger.log_every(data_loader, 10, header):
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        # compute output
+        with torch.cuda.amp.autocast():
+            output = model(images)
+            loss = criterion(output, target)
+
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        batch_size = images.shape[0]
+        metric_logger.update(loss=loss.item())
+        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
+          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
     
     
 def train_one_epoch(model: torch.nn.Module, teacher_model: torch.nn.Module, criterion,
@@ -20,6 +51,7 @@ def train_one_epoch(model: torch.nn.Module, teacher_model: torch.nn.Module, crit
                     set_training_mode=True, args = None):
     
     model.train(set_training_mode)
+    teacher_model.eval()
     
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -60,12 +92,14 @@ def train_one_epoch(model: torch.nn.Module, teacher_model: torch.nn.Module, crit
     
 def train_model(args, model, teacher_model, 
                 criterion, optimizer, loss_scaler, lr_scheduler,
-                train_data, test_data, test_dataset,
-                device, n_parameters):
+                train_data, device, n_parameters):
+    
+    checkpoint_path = args.output_dir / "checkpoint.pth"
+    with (args.output_dir / "log.txt").open("a") as f:
+        f.write("Args: " + str(args) + "\n")
+    
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_accuracy = 0.0
-    
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             model, teacher_model, criterion, train_data,
@@ -75,37 +109,18 @@ def train_model(args, model, teacher_model,
             args = args,
         )
 
-        lr_scheduler.step(epoch)
+        # lr_scheduler.step(epoch)
         
-        if epoch%10 == 0:
-            checkpoint_path = args.output_dir / 'checkpoint.pth'
-            checkpoint_dict = {
+        model_dict = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'lr_scheduler': lr_scheduler.state_dict(),
+            # 'lr_scheduler': lr_scheduler.state_dict(),
             'epoch': epoch,
             'scaler': loss_scaler.state_dict(),
             'args': args,
             }
-            torch.save(checkpoint_dict, checkpoint_path)
-
-        # test_stats = evaluate(test_data, model, device)
-        # print(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
-        
-        # if max_accuracy < test_stats["acc1"]:
-        #     max_accuracy = test_stats["acc1"]
-        #     checkpoint_path = args.output_dir / 'best_checkpoint.pth'
-        #     checkpoint_dict = {
-        #     'model': model.state_dict(),
-        #     'optimizer': optimizer.state_dict(),
-        #     'lr_scheduler': lr_scheduler.state_dict(),
-        #     'epoch': epoch,
-        #     'scaler': loss_scaler.state_dict(),
-        #     'args': args,
-        #     }
-        #     torch.save(checkpoint_dict, checkpoint_path)
-            
-        # print(f'Max accuracy: {max_accuracy}%')
+        if epoch%10 == 0:
+            torch.save(model_dict, checkpoint_path)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                     #  **{f'test_{k}': v for k, v in test_stats.items()},
@@ -117,6 +132,8 @@ def train_model(args, model, teacher_model,
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    
     with (args.output_dir / "log.txt").open("a") as f:
         f.write("Training time:" + json.dumps(total_time_str) + "\n")
     
+    return model, model_dict

@@ -30,6 +30,8 @@ def get_args_parser():
     
     # mixer model parameters
     parser.add_argument("--replace", nargs="+", type=int, help="list for index of blocks to be replaced")
+    parser.add_argument("--rep-mode", default="all", choices=["qkv", "all"], 
+                        help="Choose to relace whole attention block or only qkv part")
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
@@ -77,7 +79,7 @@ def get_args_parser():
     parser.add_argument('--output-dir', default='', help='path where to save, empty for no saving')
     parser.add_argument('--epochs', default=2, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
-    parser.add_argument('--batch-size', default=256, type=int)
+    parser.add_argument('--batch-size', default=512, type=int)
     parser.add_argument("--drop", type=float, default=0.0, metavar="PCT",
                         help="Dropout rate (default: 0.)")
     parser.add_argument("--drop-path", type=float, default=0.1, metavar="PCT",
@@ -92,7 +94,7 @@ def get_args_parser():
     
     # Learning rate schedule parameters
     parser.add_argument('--unscale-lr', action='store_true')
-    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
+    parser.add_argument('--lr', type=float, default=5e-3, metavar='LR',
                         help='learning rate (default: 5e-4)')
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
@@ -139,14 +141,23 @@ def load_weight(model, weight):
     return model
 
     
-def replace_att2mixer(model, repl_blocks, model_name):
+def replace_att2mixer(model, repl_blocks, model_name = "",
+                      mode = "all", weighted_model = None):
     for blk_index in repl_blocks:
-        mlp_block = MixerBlock(param_dict[model_name]["num_patches"], 
-                               param_dict[model_name]["token_hid_dim"], 
-                               param_dict[model_name]["channels_dim"], 
-                               param_dict[model_name]["channels_hid_dim"])
-        mlp_block.to("cuda")
-        model.blocks[blk_index] = mlp_block
+        if mode == "all":
+            if weighted_model == None:
+                mlp_block = MixerBlock(param_dict[model_name]["num_patches"], 
+                                       param_dict[model_name]["token_hid_dim"], 
+                                       param_dict[model_name]["channels_dim"], 
+                                       param_dict[model_name]["channels_hid_dim"])
+                mlp_block.to("cuda")
+                model.blocks[blk_index] = mlp_block
+            else:
+                model.blocks[blk_index] = weighted_model.blocks[blk_index]
+        elif mode == "qkv":
+            ...
+        else:
+            raise NotImplementedError("Not available replace method")
     return model
 
 
@@ -160,16 +171,23 @@ def cut_extra_layers(model, max_index, depth = 12):
     return model
 
 
-def set_requires_grad(model, targets, freeze=True):
+def set_requires_grad(model, targets, mode, freeze=True):
     target_names = []
     for target in targets:
         target_name = f"blocks.{target}"
         target_names.append(target_name)
     for name, param in model.named_parameters():
+        # print(name)
         if any(target in name for target in target_names):
-            param.requires_grad = not freeze
+            if mode == "qkv":
+                ...
+            elif mode == "all":
+                param.requires_grad = not freeze
+            else:
+                raise NotImplementedError("Not available replace method")
         else:
             param.requires_grad = freeze
+    # exit(0)
 
 
 def main(args):
@@ -225,27 +243,27 @@ def main(args):
     )
     model_ori = copy.deepcopy(model_deit)
     print(f"Replacing blocks: {args.replace}")
-    model_repl = replace_att2mixer(model=model_deit, repl_blocks=args.replace, model_name = args.d_model)
+    model_repl = replace_att2mixer(model=model_deit, repl_blocks=args.replace, 
+                                   mode=args.rep_mode, model_name = args.d_model)
     
     if args.eval and not args.train:
         print(f"Evaluation model: {args.eval_model}")
         model = load_weight(model_repl, args.eval_model)
         model.to(device)
-        # TODO: evaluation
-        # test_stats = evaluate(data_loader_val, model, device)
-        # print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        # return
+        test_stats = evaluate(data_loader_val, model, device)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
     elif args.train and not args.eval:
         print(f"Train model: {args.d_model}, target blocks:{args.replace}")
         model = load_weight(model_repl, args.d_weight)
         model_ori = load_weight(model_ori, args.d_weight)
+        weighted_model_ori = copy.deepcopy(model_ori)
         partial_model =  cut_extra_layers(model, max(args.replace))
         partial_model_ori = cut_extra_layers(model_ori, max(args.replace))
         partial_model.to(device)
         partial_model_ori.to(device)
         
-        set_requires_grad(partial_model, args.replace)
+        set_requires_grad(partial_model, args.replace, args.rep_mode)
         set_requires_grad(partial_model_ori, [])
         partial_model.to(device)
         partial_model_ori.to(device)
@@ -267,28 +285,27 @@ def main(args):
         args.output_dir = Path(output_dir)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         
-        train_model(args, partial_model, partial_model_ori,
-                    criterion, optimizer, loss_scaler, lr_scheduler,
-                    data_loader_train, data_loader_val, dataset_val,
-                    device, n_parameters)
-        
-        # summary(partial_model, (3, 224, 224))
-        # summary(partial_model_ori, (3, 224, 224))
+        trained_model, trained_model_dict = train_model(args, partial_model, partial_model_ori,
+                                                        criterion, optimizer, loss_scaler, lr_scheduler,
+                                                        data_loader_train, device, n_parameters)
+        trained_model = replace_att2mixer(model=weighted_model_ori, repl_blocks=args.replace, 
+                                          weighted_model= trained_model)
+        print(trained_model)
+        save_path = args.output_dir / "replaced_model.pth"
+        trained_model_dict["model"] = trained_model.state_dict()
+        torch.save(trained_model_dict, save_path)
         
     else:
         raise ValueError("Please specify running mode (eval/train).") 
     
-    # input_tensor = torch.randn(1, 3, 224, 224)
-    # input_tensor = input_tensor.to(device)
-    # features = partial_model.forward_features(input_tensor)
-    # print(features.shape) 
     # summary(partial_model, (3, 224, 224))
-    # print(model)
     # print(model.blocks[1].token_mixing.fc1.weight)
     # print(model.blocks[0].mlp.fc1.weight)
     # print(partial_model.blocks[0].mlp.fc1.weight)
-
-    # TODO: get first blocks of target model, calculate loss using cosine what
+    
+    # TODO: add the choice of only replace qkv layers
+    # TODO: take output without change model structure
+    # TODO: add distribution learning
 
 
 if __name__ == '__main__':
@@ -304,6 +321,7 @@ if __name__ == '__main__':
     args.replace = repl_index
     
     args.train = True
+    args.sched = "constant"
         
     main(args)
 
