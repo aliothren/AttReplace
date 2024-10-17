@@ -7,14 +7,31 @@ from torchsummary import summary
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-param_dict = {
+param_dict_qkv = {
+    "deit_tiny_patch16_224":{
+        "num_patches": 197,
+        "token_hid_dim": 128,
+        "channels_dim": 192,
+        "channels_hid_dim": 256,
+    },
+   
+    "deit_base_patch16_224":{ # to be determined
+        "num_patches": 197,
+        "token_hid_dim": 3072,
+        "channels_dim": 768,
+        "channels_hid_dim": 3072,
+    }
+}
+
+param_dict_all = {
     "deit_tiny_patch16_224":{
         "num_patches": 197,
         "token_hid_dim": 512,
-        "channels_dim": 192,
-        "channels_hid_dim": 512,
+        "channels_dim": 512,
+        "channels_hid_dim": 256,
     },
-    "deit_base_patch16_224":{
+   
+    "deit_base_patch16_224":{ # to be determined
         "num_patches": 197,
         "token_hid_dim": 3072,
         "channels_dim": 768,
@@ -47,7 +64,7 @@ class MixerBlock(nn.Module):
                  token_hid_dim, 
                  channels_dim,
                  channels_hid_dim,
-                 dropout = 0.
+                 dropout = 0. 
                  ):
         super(MixerBlock, self).__init__()
         self.token_mixing = MlpBlock(num_patches, token_hid_dim, dropout)

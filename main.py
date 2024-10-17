@@ -10,7 +10,7 @@ import torch.backends.cudnn as cudnn
 from datasets import build_dataset
 from loss import CosineSimilarityLoss
 from train import train_model, evaluate
-from models import MixerBlock, EmptyBlock, param_dict
+from models import MixerBlock, EmptyBlock, param_dict_all, param_dict_qkv
 
 from pathlib import Path
 from torchsummary import summary
@@ -144,20 +144,29 @@ def load_weight(model, weight):
 def replace_att2mixer(model, repl_blocks, model_name = "",
                       mode = "all", weighted_model = None):
     for blk_index in repl_blocks:
-        if mode == "all":
-            if weighted_model == None:
-                mlp_block = MixerBlock(param_dict[model_name]["num_patches"], 
-                                       param_dict[model_name]["token_hid_dim"], 
-                                       param_dict[model_name]["channels_dim"], 
-                                       param_dict[model_name]["channels_hid_dim"])
+        
+        if weighted_model == None:
+            if mode == "all":
+                mlp_block = MixerBlock(param_dict_all[model_name]["num_patches"], 
+                                       param_dict_all[model_name]["token_hid_dim"], 
+                                       param_dict_all[model_name]["channels_dim"], 
+                                       param_dict_all[model_name]["channels_hid_dim"])
                 mlp_block.to("cuda")
                 model.blocks[blk_index] = mlp_block
+            elif mode == "qkv":
+                mlp_block = MixerBlock(param_dict_qkv[model_name]["num_patches"], 
+                                       param_dict_qkv[model_name]["token_hid_dim"], 
+                                       param_dict_qkv[model_name]["channels_dim"], 
+                                       param_dict_qkv[model_name]["channels_hid_dim"])
+                mlp_block.to("cuda")
+                mlp_block.norm1 = nn.Identity()
+                model.blocks[blk_index].attn = mlp_block
             else:
-                model.blocks[blk_index] = weighted_model.blocks[blk_index]
-        elif mode == "qkv":
-            ...
+                raise NotImplementedError("Not available replace method")
+            
         else:
-            raise NotImplementedError("Not available replace method")
+            model.blocks[blk_index] = weighted_model.blocks[blk_index]
+
     return model
 
 
@@ -303,7 +312,6 @@ def main(args):
     # print(model.blocks[0].mlp.fc1.weight)
     # print(partial_model.blocks[0].mlp.fc1.weight)
     
-    # TODO: add the choice of only replace qkv layers
     # TODO: take output without change model structure
     # TODO: add distribution learning
 
@@ -319,6 +327,7 @@ if __name__ == '__main__':
     args.d_model = deit_model
     args.d_weight = deit_weight
     args.replace = repl_index
+    args.rep_mode = "qkv"
     
     args.train = True
     args.sched = "constant"
