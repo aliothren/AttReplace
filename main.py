@@ -77,7 +77,7 @@ def get_args_parser():
     # training parameters
     parser.add_argument('--device', default='cuda', help='device to use for training / testing')
     parser.add_argument('--output-dir', default='', help='path where to save, empty for no saving')
-    parser.add_argument('--epochs', default=2, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
     parser.add_argument('--batch-size', default=512, type=int)
     parser.add_argument("--drop", type=float, default=0.0, metavar="PCT",
@@ -180,23 +180,22 @@ def cut_extra_layers(model, max_index, depth = 12):
     return model
 
 
-def set_requires_grad(model, targets, mode, freeze=True):
-    target_names = []
-    for target in targets:
-        target_name = f"blocks.{target}"
-        target_names.append(target_name)
+def set_requires_grad(model, targets, mode, trainable=True):
+    target_names = [f"blocks.{target}" for target in targets]
     for name, param in model.named_parameters():
         # print(name)
         if any(target in name for target in target_names):
             if mode == "qkv":
-                ...
+                if "mlp" in name:
+                    param.requires_grad = not trainable
+                else:
+                    param.requires_grad = trainable
             elif mode == "all":
-                param.requires_grad = not freeze
+                param.requires_grad = trainable
             else:
                 raise NotImplementedError("Not available replace method")
         else:
-            param.requires_grad = freeze
-    # exit(0)
+            param.requires_grad = not trainable
 
 
 def main(args):
@@ -273,7 +272,7 @@ def main(args):
         partial_model_ori.to(device)
         
         set_requires_grad(partial_model, args.replace, args.rep_mode)
-        set_requires_grad(partial_model_ori, [])
+        set_requires_grad(partial_model_ori, [], args.rep_mode)
         partial_model.to(device)
         partial_model_ori.to(device)
         
@@ -299,7 +298,7 @@ def main(args):
                                                         data_loader_train, device, n_parameters)
         trained_model = replace_att2mixer(model=weighted_model_ori, repl_blocks=args.replace, 
                                           weighted_model= trained_model)
-        print(trained_model)
+        # print(trained_model)
         save_path = args.output_dir / "replaced_model.pth"
         trained_model_dict["model"] = trained_model.state_dict()
         torch.save(trained_model_dict, save_path)
@@ -322,12 +321,12 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [1]
+    repl_index = [11]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
     args.replace = repl_index
-    args.rep_mode = "qkv"
+    args.rep_mode = "all"
     
     args.train = True
     args.sched = "constant"

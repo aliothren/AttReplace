@@ -27,8 +27,8 @@ param_dict_all = {
     "deit_tiny_patch16_224":{
         "num_patches": 197,
         "token_hid_dim": 512,
-        "channels_dim": 512,
-        "channels_hid_dim": 256,
+        "channels_dim": 192,
+        "channels_hid_dim": 512,
     },
    
     "deit_base_patch16_224":{ # to be determined
