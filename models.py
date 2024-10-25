@@ -10,16 +10,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 param_dict_qkv = {
     "deit_tiny_patch16_224":{
         "num_patches": 197,
-        "token_hid_dim": 128,
-        "channels_dim": 192,
-        "channels_hid_dim": 256,
+        "token_hid_dim": 384,
     },
    
     "deit_base_patch16_224":{ # to be determined
         "num_patches": 197,
         "token_hid_dim": 3072,
-        "channels_dim": 768,
-        "channels_hid_dim": 3072,
     }
 }
 
@@ -59,33 +55,43 @@ class MlpBlock(nn.Module):
 
 class MixerBlock(nn.Module):
     """This is the mixer block to replace attention module"""
-    def __init__(self, 
-                 num_patches,
-                 token_hid_dim, 
-                 channels_dim,
-                 channels_hid_dim,
-                 dropout = 0. 
-                 ):
+    def __init__(self, mode, model_name, dropout = 0. ):
         super(MixerBlock, self).__init__()
-        self.token_mixing = MlpBlock(num_patches, token_hid_dim, dropout)
-        self.channel_mixing = MlpBlock(channels_dim, channels_hid_dim, dropout)
-        self.norm1 = nn.LayerNorm(channels_dim)
-        self.norm2 = nn.LayerNorm(channels_dim)
-
+        self.mode = mode
+        if mode == "qkv":
+            self.param_dict = param_dict_qkv
+        else:
+            self.param_dict = param_dict_all
+            
+        self.token_mixing = MlpBlock(self.param_dict[model_name]["num_patches"],
+                                     self.param_dict[model_name]["token_hid_dim"],
+                                     dropout)
+        if mode == "all":
+            self.channel_mixing = MlpBlock(self.param_dict[model_name]["channels_dim"],
+                                           self.param_dict[model_name]["channels_hid_dim"],
+                                           dropout)
+            self.norm1 = nn.LayerNorm(self.param_dict[model_name]["channels_dim"])
+            self.norm2 = nn.LayerNorm(self.param_dict[model_name]["channels_dim"])
+        
     def forward(self, x):
         # Token mixing
-        y = self.norm1(x)
+        if self.mode == "all":
+            y = self.norm1(x)
+        else:
+            y = x
+            
         y = y.transpose(1, 2)
         y = self.token_mixing(y)
         y = y.transpose(1, 2)
         x = x + y
-
-        # Channel mixing
-        y = self.norm2(x)
-        y = self.channel_mixing(y)
         
-        return x + y 
-
+        if self.mode == "all":
+            y = self.norm2(x)
+            y = self.channel_mixing(y)
+            x = x + y
+        
+        return x
+            
 
 class MlpMixer(nn.Module):
     """Mixer architecture."""

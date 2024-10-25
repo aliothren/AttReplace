@@ -9,8 +9,8 @@ import torch.backends.cudnn as cudnn
 
 from datasets import build_dataset
 from loss import CosineSimilarityLoss
-from train import train_model, evaluate
-from models import MixerBlock, EmptyBlock, param_dict_all, param_dict_qkv
+from models import MixerBlock, EmptyBlock
+from train import train_model, finetune_model, evaluate
 
 from pathlib import Path
 from torchsummary import summary
@@ -35,6 +35,8 @@ def get_args_parser():
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
+    parser.add_argument('--finetune', action='store_true', help='Finetuning the whole model')
+    parser.add_argument("--ft-model", default="", help="Path of model to be finetuned")
     
     # data parameters
     parser.add_argument("--data-path", default="/home/u17/yuxinr/datasets/", type=str, help="dataset path")
@@ -94,10 +96,18 @@ def get_args_parser():
     
     # Learning rate schedule parameters
     parser.add_argument('--unscale-lr', action='store_true')
-    parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
+    
+    # Finetune parameters
+    parser.add_argument("--ft-unscale-lr", action="store_true")
+    parser.add_argument("--ft-lr", default=5e-5, type=float)
+    parser.add_argument("--ft-batch-size", default=512, type=int)
+    parser.add_argument("--ft-epochs", default=50, type=int)
+    parser.add_argument("--ft-start-epoch", default=0, type=int)
+    parser.add_argument('--ft-clip-grad', type=float, default=None, metavar='NORM') 
     
     return parser
     
@@ -147,19 +157,12 @@ def replace_att2mixer(model, repl_blocks, model_name = "",
         
         if weighted_model == None:
             if mode == "all":
-                mlp_block = MixerBlock(param_dict_all[model_name]["num_patches"], 
-                                       param_dict_all[model_name]["token_hid_dim"], 
-                                       param_dict_all[model_name]["channels_dim"], 
-                                       param_dict_all[model_name]["channels_hid_dim"])
+                mlp_block = MixerBlock(mode, model_name)
                 mlp_block.to("cuda")
                 model.blocks[blk_index] = mlp_block
             elif mode == "qkv":
-                mlp_block = MixerBlock(param_dict_qkv[model_name]["num_patches"], 
-                                       param_dict_qkv[model_name]["token_hid_dim"], 
-                                       param_dict_qkv[model_name]["channels_dim"], 
-                                       param_dict_qkv[model_name]["channels_hid_dim"])
+                mlp_block = MixerBlock(mode, model_name)
                 mlp_block.to("cuda")
-                mlp_block.norm1 = nn.Identity()
                 model.blocks[blk_index].attn = mlp_block
             else:
                 raise NotImplementedError("Not available replace method")
@@ -184,7 +187,9 @@ def set_requires_grad(model, targets, mode, trainable=True):
     target_names = [f"blocks.{target}" for target in targets]
     for name, param in model.named_parameters():
         # print(name)
-        if any(target in name for target in target_names):
+        if mode == "finetune":
+            param.requires_grad = trainable
+        elif any(target in name for target in target_names):
             if mode == "qkv":
                 if "mlp" in name:
                     param.requires_grad = not trainable
@@ -238,30 +243,30 @@ def main(args):
         drop_last=False
     )
     
-    # create structure of DeiT
-    print(f"Creating DeiT model: {args.d_model}")
-    model_deit = create_model(
-        args.d_model,
-        pretrained=False,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        img_size=args.input_size
-    )
-    model_ori = copy.deepcopy(model_deit)
-    print(f"Replacing blocks: {args.replace}")
-    model_repl = replace_att2mixer(model=model_deit, repl_blocks=args.replace, 
-                                   mode=args.rep_mode, model_name = args.d_model)
-    
-    if args.eval and not args.train:
+    if args.eval and not args.train and not args.finetune:
         print(f"Evaluation model: {args.eval_model}")
-        model = load_weight(model_repl, args.eval_model)
+        model = torch.load(args.eval_model)
         model.to(device)
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
-    elif args.train and not args.eval:
+    elif args.train and not args.eval and not args.finetune:
+        # create structure of DeiT
+        print(f"Creating DeiT model: {args.d_model}")
+        model_deit = create_model(
+            args.d_model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            drop_block_rate=None,
+            img_size=args.input_size
+        )
+        model_ori = copy.deepcopy(model_deit)
+        print(f"Replacing blocks: {args.replace}")
+        model_repl = replace_att2mixer(model=model_deit, repl_blocks=args.replace, 
+                                       mode=args.rep_mode, model_name = args.d_model)
+    
         print(f"Train model: {args.d_model}, target blocks:{args.replace}")
         model = load_weight(model_repl, args.d_weight)
         model_ori = load_weight(model_ori, args.d_weight)
@@ -304,16 +309,47 @@ def main(args):
         # torch.save(trained_model_dict, save_path)
         torch.save(trained_model, save_path)
         
+    elif args.finetune and not args.train and not args.eval:
+        print(f"Finetuning model: {args.ft_model}")
+        model = torch.load(args.ft_model)
+        model.to(device)
+        set_requires_grad(model, list(range(len(model.blocks))), "finetune")
+        
+        n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print('number of finetunable params:', n_parameters)
+        
+        args.unscale_lr = args.ft_unscale_lr
+        args.lr = args.ft_lr
+        args.batch_size = args.ft_batch_size
+        args.output_dir = Path(args.ft_model[:-18])
+        args.epochs = args.ft_epochs
+        args.start_epoch = args.ft_start_epoch
+        args.clip_grad = args.ft_clip_grad
+        args.sched = "constant"
+        
+        if not args.unscale_lr:
+            linear_scaled_lr = args.lr * args.batch_size / 512.0
+            args.lr = linear_scaled_lr
+        optimizer = create_optimizer(args, model)
+        loss_scaler = NativeScaler()
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        finetuned_model, finetuned_model_dict = finetune_model(args, partial_model, criterion, optimizer, 
+                                                           loss_scaler, data_loader_train, device, n_parameters)
+        
+        # print(trained_model)
+        save_path = args.output_dir / "finetuned_model.pth"
+        finetuned_model_dict["model"] = finetuned_model.state_dict()
+        # torch.save(trained_model_dict, save_path)
+        torch.save(finetuned_model, save_path)
+        
     else:
-        raise ValueError("Please specify running mode (eval/train).") 
+        raise ValueError("Please specify running mode (eval/train/finetune).") 
     
     # summary(partial_model, (3, 224, 224))
     # print(model.blocks[1].token_mixing.fc1.weight)
     # print(model.blocks[0].mlp.fc1.weight)
     # print(partial_model.blocks[0].mlp.fc1.weight)
-    
-    # TODO: take output without change model structure
-    # TODO: add distribution learning
 
 
 if __name__ == '__main__':
@@ -322,32 +358,27 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [11]
+    repl_index = [7]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
     args.replace = repl_index
     args.rep_mode = "all"
-    args.epochs = 100
+    args.epochs = 50
+    args.lr = 5e-4
+    args.batch_size = 512
+    # args.opt = "sgd"
     
     args.train = True
+    # args.train = False
+    # args.eval = True
+    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-10-23-14-14/replaced_model.pth"
+    
     # args.sched = "constant"
         
     main(args)
 
  
-# 
-# batch_size = "128"
-# epochs = "6"
-# model = "deit_base_patch16_224"
-# input_size = "224"
-# stochastic_depth = "0"
-# opt = "sgd"
-# weight_decay = "1e-4"
-# lr = "0.01"
-# random_erase = "0"
-# num_workers = "1"
-# 
 # 
 # subprocess.run([
 #     "python", "main.py",
