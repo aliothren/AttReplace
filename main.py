@@ -203,6 +203,34 @@ def set_requires_grad(model, targets, mode, trainable=True):
             param.requires_grad = not trainable
 
 
+def load_dataset(args, mode):
+    if mode == "train":
+        print(f"Loading training dataset {args.data_set}")
+        dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
+        return data_loader_train
+    
+    elif mode == "val":
+        print(f"Loading validation dataset {args.data_set}")
+        dataset_val, args.nb_classes = build_dataset(is_train=False, args=args)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=int(1.5 * args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
+        return data_loader_val, dataset_val
+
+
 def main(args):
     print(args)
 
@@ -218,41 +246,35 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
-
     cudnn.benchmark = True
-    # Load datasets
-    print(f"Loading dataset {args.data_set}")
-    dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
-    dataset_val, _ = build_dataset(is_train=False, args=args)
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
-    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
-    ### here: extra data augmentation not implemented, mix-up not implemented
-    data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, sampler=sampler_val,
-        batch_size=int(1.5 * args.batch_size),
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=False
-    )
-    
+
     if args.eval and not args.train and not args.finetune:
+        data_loader_val, dataset_val = load_dataset(args, "val")
         print(f"Evaluation model: {args.eval_model}")
         model = torch.load(args.eval_model)
+        # Using when wrong head only
+        model_deit = create_model(
+            args.d_model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            drop_block_rate=None,
+            img_size=args.input_size
+        )
+        model_deit = load_weight(model_deit, args.d_weight)
+        model.head = model_deit.head
+        # print(model)
         model.to(device)
+        set_requires_grad(model, [], "all")
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
     elif args.train and not args.eval and not args.finetune:
+        data_loader_train = load_dataset(args, "train")
         # create structure of DeiT
         print(f"Creating DeiT model: {args.d_model}")
+        args.nb_classes = 1000 # if using CIFAR train imnet model
         model_deit = create_model(
             args.d_model,
             pretrained=False,
@@ -310,6 +332,7 @@ def main(args):
         torch.save(trained_model, save_path)
         
     elif args.finetune and not args.train and not args.eval:
+        data_loader_train = load_dataset(args, "train")
         print(f"Finetuning model: {args.ft_model}")
         model = torch.load(args.ft_model)
         model.to(device)
@@ -358,7 +381,7 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [7]
+    repl_index = [10]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
@@ -369,12 +392,14 @@ if __name__ == '__main__':
     args.batch_size = 512
     # args.opt = "sgd"
     
-    args.train = True
-    # args.train = False
-    # args.eval = True
-    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-10-23-14-14/replaced_model.pth"
+    # args.data_set = "CIFAR"
+    # args.train = True
     
-    # args.sched = "constant"
+    args.data_set = "IMNET"
+    args.train = False
+    args.eval = True
+    args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-10-24-21-35/replaced_model.pth"
+    args.sched = "constant"
         
     main(args)
 

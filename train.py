@@ -15,11 +15,10 @@ from timm.utils import accuracy
 def evaluate(data_loader, model, device):
     criterion = torch.nn.CrossEntropyLoss()
 
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
-
     # switch to evaluation mode
     model.eval()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
 
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
@@ -148,13 +147,13 @@ def finetune_one_epoch(model: torch.nn.Module, criterion, data_loader: Iterable,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
     
-    for samples, _ in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
          
         with torch.cuda.amp.autocast():
-            outputs = model.forward_features(samples)
-            targets = teacher_model.forward_features(samples)
-            loss = criterion(outputs, targets)
+            outputs = model(samples)
+            loss = criterion(samples, outputs, targets)
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
