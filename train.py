@@ -43,9 +43,9 @@ def evaluate(data_loader, model, device):
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
     
-def train_one_epoch(model: torch.nn.Module, teacher_model: torch.nn.Module, criterion,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
+def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module, 
+                    criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
+                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0, 
                     set_training_mode=True):
     
     model.train(set_training_mode)
@@ -56,13 +56,24 @@ def train_one_epoch(model: torch.nn.Module, teacher_model: torch.nn.Module, crit
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
     
-    for samples, _ in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
          
         with torch.cuda.amp.autocast():
-            outputs = model.forward_features(samples)
-            targets = teacher_model.forward_features(samples)
-            loss = criterion(outputs, targets)
+            if mode == "train" or mode == "cosine":
+                outputs = model.forward_features(samples)
+                teacher_output = teacher_model.forward_features(samples)
+                loss = criterion(outputs, teacher_output)
+            elif mode == "class":
+                outputs = model(samples)
+                loss = criterion(outputs, targets)
+            elif mode == "combine":
+                cos_outputs = model.forward_features(samples)
+                cos_teacher_output = teacher_model.forward_features(samples)
+                cls_outputs = model(samples)
+                loss = criterion(cos_outputs, cos_teacher_output, cls_outputs, targets)
+                
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -88,23 +99,27 @@ def train_one_epoch(model: torch.nn.Module, teacher_model: torch.nn.Module, crit
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
     
-def train_model(args, model, teacher_model, 
+def train_model(args, mode, model, teacher_model, 
                 criterion, optimizer, loss_scaler, lr_scheduler,
                 train_data, device, n_parameters):
     
-    checkpoint_path = args.output_dir / "checkpoint.pth"
     with (args.output_dir / "log.txt").open("a") as f:
         f.write("Args: " + str(args) + "\n")
-    
-    print(f"Start training for {args.epochs} epochs")
+        
+    if mode == "train":
+        checkpoint_path = args.output_dir / "checkpoint.pth"
+        print(f"Start training for {args.epochs} epochs")
+        
+    else:
+        checkpoint_path = args.output_dir / "ft_checkpoint.pth"
+        print(f"Start finetuning for {args.epochs} epochs")
+        
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
-            model, teacher_model, criterion, train_data,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad,
-            set_training_mode=args.train_mode
-        )
+            mode, model, teacher_model, criterion, train_data, optimizer,
+            device, epoch, loss_scaler,args.clip_grad, 
+            set_training_mode=args.train_mode)
 
         lr_scheduler.step(epoch)
         
@@ -128,91 +143,15 @@ def train_model(args, model, teacher_model,
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
     
-    with (args.output_dir / "log.txt").open("a") as f:
-        f.write("Training time:" + json.dumps(total_time_str) + "\n")
-    
-    return model, model_dict
-
-
-def finetune_one_epoch(model: torch.nn.Module, criterion, data_loader: Iterable, 
-                       optimizer: torch.optim.Optimizer, device: torch.device, epoch: int, 
-                       loss_scaler, max_norm: float = 0, set_training_mode=True):
-    
-    model.train(set_training_mode)
-    
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
-    
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-         
-        with torch.cuda.amp.autocast():
-            outputs = model(samples)
-            loss = criterion(samples, outputs, targets)
-        loss_value = loss.item()
-
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-def finetune_model(args, model, criterion, optimizer, loss_scaler,
-                   train_data, device, n_parameters):
-    
-    checkpoint_path = args.output_dir / "ft_checkpoint.pth"
-    with (args.output_dir / "ft_log.txt").open("a") as f:
-        f.write("Args: " + str(args) + "\n")
-    
-    print(f"Start finetuning for {args.epochs} epochs")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        ft_stats = finetune_one_epoch(model, criterion, train_data,
-                                      optimizer, device, epoch, 
-                                      loss_scaler, args.clip_grad)
-        model_dict = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'scaler': loss_scaler.state_dict(),
-            'args': args,
-            }
-        torch.save(model_dict, checkpoint_path)
-
-        log_stats = {**{f'finetune_{k}': v for k, v in ft_stats.items()},
-                    #  **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+    if mode == "train":
+        print('Training time {}'.format(total_time_str))
         with (args.output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Finetuning time {}'.format(total_time_str))
-    
-    with (args.output_dir / "ft_log.txt").open("a") as f:
-        f.write("Finetuning time:" + json.dumps(total_time_str) + "\n")
-    
+            f.write("Training time:" + json.dumps(total_time_str) + "\n")
+    else:
+        print('Finetuning time {}'.format(total_time_str))
+        with (args.output_dir / "log.txt").open("a") as f:
+            f.write("Finetuning time:" + json.dumps(total_time_str) + "\n")
+            
     return model, model_dict
+

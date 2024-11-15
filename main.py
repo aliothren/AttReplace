@@ -8,9 +8,9 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
 from datasets import build_dataset
-from loss import CosineSimilarityLoss
+from train import train_model, evaluate
 from models import MixerBlock, EmptyBlock
-from train import train_model, finetune_model, evaluate
+from loss import CosineSimilarityLoss, CombinedLoss
 
 from pathlib import Path
 from torchsummary import summary
@@ -87,7 +87,7 @@ def get_args_parser():
     parser.add_argument("--drop-path", type=float, default=0.1, metavar="PCT",
                         help="Drop path rate (default: 0.1)")
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--num_workers', default=0, type=int)
+    parser.add_argument('--num_workers', default=6, type=int)
     parser.add_argument('--pin-mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.set_defaults(pin_mem=True)
@@ -108,7 +108,8 @@ def get_args_parser():
     parser.add_argument("--ft-epochs", default=50, type=int)
     parser.add_argument("--ft-start-epoch", default=0, type=int)
     parser.add_argument('--ft-clip-grad', type=float, default=None, metavar='NORM') 
-    
+    parser.add_argument("--ft-mode", default="cosine", choices=["cosine", "class", "combine"],
+                        type=str, help="criterion of finetune")
     return parser
     
 
@@ -262,9 +263,10 @@ def main(args):
             drop_block_rate=None,
             img_size=args.input_size
         )
-        model_deit = load_weight(model_deit, args.d_weight)
-        model.head = model_deit.head
-        # print(model)
+        model_head = load_weight(model_deit, args.d_weight)
+        # model_head = torch.load("/home/u17/yuxinr/block_distill/model/2024-11-01-18-22/deit_model_cifar_head.pth")
+        model.head = model_head.head
+        
         model.to(device)
         set_requires_grad(model, [], "all")
         test_stats = evaluate(data_loader_val, model, device)
@@ -320,9 +322,11 @@ def main(args):
         args.output_dir = Path(output_dir)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         
-        trained_model, trained_model_dict = train_model(args, partial_model, partial_model_ori,
-                                                        criterion, optimizer, loss_scaler, lr_scheduler,
-                                                        data_loader_train, device, n_parameters)
+        trained_model, trained_model_dict = train_model(
+            args=args, mode="train", model=partial_model, teacher_model=partial_model_ori,
+            criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler,
+            lr_scheduler=lr_scheduler, train_data=data_loader_train, device=device,
+            n_parameters=n_parameters)
         trained_model = replace_att2mixer(model=weighted_model_ori, repl_blocks=args.replace, 
                                           weighted_model= trained_model)
         # print(trained_model)
@@ -335,6 +339,13 @@ def main(args):
         data_loader_train = load_dataset(args, "train")
         print(f"Finetuning model: {args.ft_model}")
         model = torch.load(args.ft_model)
+        
+        # when changing head:
+        change2cifar_head = True
+        if change2cifar_head:
+            model_head = torch.load("/home/u17/yuxinr/block_distill/model/2024-11-01-18-22/deit_model_cifar_head.pth")
+            model.head = model_head.head
+        
         model.to(device)
         set_requires_grad(model, list(range(len(model.blocks))), "finetune")
         
@@ -348,31 +359,55 @@ def main(args):
         args.epochs = args.ft_epochs
         args.start_epoch = args.ft_start_epoch
         args.clip_grad = args.ft_clip_grad
-        args.sched = "constant"
+        # args.sched = "constant"
         
         if not args.unscale_lr:
             linear_scaled_lr = args.lr * args.batch_size / 512.0
             args.lr = linear_scaled_lr
         optimizer = create_optimizer(args, model)
         loss_scaler = NativeScaler()
-        criterion = torch.nn.CrossEntropyLoss()
+        lr_scheduler, _ = create_scheduler(args, optimizer)
         
-        finetuned_model, finetuned_model_dict = finetune_model(args, partial_model, criterion, optimizer, 
-                                                           loss_scaler, data_loader_train, device, n_parameters)
+        if args.ft_mode == "class":
+            criterion = torch.nn.CrossEntropyLoss()
+            teacher = None
+            
+        else:
+            model_deit = create_model(
+                args.d_model,
+                pretrained=False,
+                num_classes=args.nb_classes,
+                drop_rate=args.drop,
+                drop_path_rate=args.drop_path,
+                drop_block_rate=None,
+                img_size=args.input_size
+            )
+            teacher = load_weight(model_deit, args.d_weight)
+            teacher.to(device)
+            if change2cifar_head:
+                teacher.head = model_head.head
+        
+            if args.ft_mode == "cosine":
+                criterion = CosineSimilarityLoss()
+            elif args.ft_mode == "combine":
+                criterion == CombinedLoss()
+            else:
+                raise ValueError("Wrong finetune mode.") 
+                
+        finetuned_model, finetuned_model_dict = train_model(
+            args=args, mode=args.ft_mode, model=model, teacher_model=teacher,
+            criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler,
+            lr_scheduler=lr_scheduler, train_data=data_loader_train, device=device,
+            n_parameters=n_parameters)
         
         # print(trained_model)
-        save_path = args.output_dir / "finetuned_model.pth"
+        save_path = args.output_dir / f"finetuned_model_{args.ft_mode}.pth"
         finetuned_model_dict["model"] = finetuned_model.state_dict()
         # torch.save(trained_model_dict, save_path)
         torch.save(finetuned_model, save_path)
         
     else:
         raise ValueError("Please specify running mode (eval/train/finetune).") 
-    
-    # summary(partial_model, (3, 224, 224))
-    # print(model.blocks[1].token_mixing.fc1.weight)
-    # print(model.blocks[0].mlp.fc1.weight)
-    # print(partial_model.blocks[0].mlp.fc1.weight)
 
 
 if __name__ == '__main__':
@@ -387,37 +422,33 @@ if __name__ == '__main__':
     args.d_weight = deit_weight
     args.replace = repl_index
     args.rep_mode = "all"
-    args.epochs = 50
+    args.epochs = 30
     args.lr = 5e-4
-    args.batch_size = 512
+    args.batch_size = 2048
     # args.opt = "sgd"
     
-    # args.data_set = "CIFAR"
-    # args.train = True
-    
+    # train
     args.data_set = "IMNET"
-    args.train = False
-    args.eval = True
-    args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-10-24-21-35/replaced_model.pth"
-    args.sched = "constant"
+    args.data_path = "/contrib/datasets/ILSVRC2012/"
+    args.train = True
+    
+    # eval
+    # args.data_set = "IMNET"
+    # args.train = False
+    # args.eval = True
+    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-10-31-17-29/finetuned_model_cosine.pth"
+    # args.sched = "constant"
+    
+    # finetune
+    # args.data_set = "CIFAR"
+    # args.train = False
+    # args.finetune = True
+    # args.ft_model = "/home/u17/yuxinr/block_distill/model/2024-10-31-17-29/replaced_model.pth"
+    # args.ft_lr = 5e-5
+    # args.ft_mode = "cosine"
+    # # args.data_path = "/contrib/datasets/ILSVRC2012/"
+    # args.ft_epochs = 50
         
     main(args)
-
+    # train_head(args)
  
-# 
-# subprocess.run([
-#     "python", "main.py",
-#     "--model", model,
-#     "--batch-size", batch_size,
-#     "--epochs", epochs,
-#     "--input-size", input_size,
-#     "--drop-path", stochastic_depth,
-#     "--opt", opt,
-#     "--weight-decay", weight_decay,
-#     "--lr", lr,
-#     "--reprob", random_erase,
-#     "--finetune", fine_tune,
-#     "--data-path", data_path,
-#     "--output_dir", output_dir,
-#     "--num_workers", num_workers
-# ])
