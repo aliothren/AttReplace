@@ -10,6 +10,15 @@ import utils
 from typing import Iterable
 from timm.utils import accuracy
 
+from models import weight_schedule
+
+
+def adjust_weights(epoch, parallel_block, weight_schedule):
+    if epoch in weight_schedule:
+        new_weight = weight_schedule[epoch]
+        parallel_block.attn_weight.data.fill_(new_weight)
+        parallel_block.mixer_weight.data.fill_(1.0 - new_weight)
+
 
 @torch.no_grad()
 def evaluate(data_loader, model, device):
@@ -45,11 +54,7 @@ def evaluate(data_loader, model, device):
     
 def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module, 
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0, 
-                    set_training_mode=True):
-    
-    model.train(set_training_mode)
-    teacher_model.eval()
+                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0):
     
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -113,13 +118,24 @@ def train_model(args, mode, model, teacher_model,
     else:
         checkpoint_path = args.output_dir / "ft_checkpoint.pth"
         print(f"Start finetuning for {args.epochs} epochs")
+    
+    teacher_model.eval()
+    # model.eval()
+    # for blk in args.replace:
+    #     model.blocks[blk].train()
+    model.train()    
         
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+        if args.gradually_train:
+            for blk in args.replace:
+                adjust_weights(epoch, model.blocks[blk], weight_schedule)
+            s_weight = float(model.blocks[args.replace[0]].mixer_weight)
+            t_weight = float(model.blocks[args.replace[0]].attn_weight)
+            print(f"Teacher weight: {t_weight}; student weight: {s_weight}")
         train_stats = train_one_epoch(
             mode, model, teacher_model, criterion, train_data, optimizer,
-            device, epoch, loss_scaler,args.clip_grad, 
-            set_training_mode=args.train_mode)
+            device, epoch, loss_scaler,args.clip_grad)
 
         lr_scheduler.step(epoch)
         

@@ -9,8 +9,8 @@ import torch.backends.cudnn as cudnn
 
 from datasets import build_dataset
 from train import train_model, evaluate
-from models import MixerBlock, EmptyBlock
 from loss import CosineSimilarityLoss, CombinedLoss
+from models import MixerBlock, EmptyBlock, ParallelBlock
 
 from pathlib import Path
 from torchsummary import summary
@@ -32,9 +32,11 @@ def get_args_parser():
     parser.add_argument("--replace", nargs="+", type=int, help="list for index of blocks to be replaced")
     parser.add_argument("--rep-mode", default="all", choices=["qkv", "all"], 
                         help="Choose to relace whole attention block or only qkv part")
+    parser.add_argument("--qkv-ft", default="", choices=["", "FC", "block"])
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
+    parser.add_argument("--gradually-train", action="store_true", help="Gradually distill weight from teacher to student")
     parser.add_argument('--finetune', action='store_true', help='Finetuning the whole model')
     parser.add_argument("--ft-model", default="", help="Path of model to be finetuned")
     
@@ -152,24 +154,32 @@ def load_weight(model, weight):
     return model
 
     
-def replace_att2mixer(model, repl_blocks, model_name = "",
-                      mode = "all", weighted_model = None):
+def replace_att2mixer(model, repl_blocks, model_name = "", mode = "all", 
+                      weighted_model = None, gradually = False):
     for blk_index in repl_blocks:
         
         if weighted_model == None:
             if mode == "all":
-                mlp_block = MixerBlock(mode, model_name)
-                mlp_block.to("cuda")
-                model.blocks[blk_index] = mlp_block
+                repl_block = MixerBlock(mode, model_name)
             elif mode == "qkv":
                 mlp_block = MixerBlock(mode, model_name)
-                mlp_block.to("cuda")
-                model.blocks[blk_index].attn = mlp_block
+                repl_block = copy.deepcopy(model.blocks[blk_index])
+                repl_block.attn = mlp_block
             else:
                 raise NotImplementedError("Not available replace method")
             
+            if gradually:
+                attn_block = copy.deepcopy(model.blocks[blk_index])
+                repl_block = ParallelBlock(attn_block, repl_block)
+                
+            repl_block.to("cuda")
+            model.blocks[blk_index] = repl_block
+            
         else:
-            model.blocks[blk_index] = weighted_model.blocks[blk_index]
+            if gradually:
+                model.blocks[blk_index] = weighted_model.blocks[blk_index].mixer_block
+            else:
+                model.blocks[blk_index] = weighted_model.blocks[blk_index]
 
     return model
 
@@ -190,6 +200,7 @@ def set_requires_grad(model, targets, mode, trainable=True):
         # print(name)
         if mode == "finetune":
             param.requires_grad = trainable
+            
         elif any(target in name for target in target_names):
             if mode == "qkv":
                 if "mlp" in name:
@@ -200,6 +211,10 @@ def set_requires_grad(model, targets, mode, trainable=True):
                 param.requires_grad = trainable
             else:
                 raise NotImplementedError("Not available replace method")
+            
+            if "attn_weight" in name or "mixer_weight" in name or "attn_block" in name:
+                param.requires_grad = not trainable
+                
         else:
             param.requires_grad = not trainable
 
@@ -286,24 +301,22 @@ def main(args):
             drop_block_rate=None,
             img_size=args.input_size
         )
+        model_deit = load_weight(model_deit, args.d_weight)
         model_ori = copy.deepcopy(model_deit)
+        model = copy.deepcopy(model_deit)
         print(f"Replacing blocks: {args.replace}")
-        model_repl = replace_att2mixer(model=model_deit, repl_blocks=args.replace, 
-                                       mode=args.rep_mode, model_name = args.d_model)
-    
-        print(f"Train model: {args.d_model}, target blocks:{args.replace}")
-        model = load_weight(model_repl, args.d_weight)
-        model_ori = load_weight(model_ori, args.d_weight)
-        weighted_model_ori = copy.deepcopy(model_ori)
-        partial_model =  cut_extra_layers(model, max(args.replace))
+        model_repl = replace_att2mixer(model=model, repl_blocks=args.replace, 
+                                       mode=args.rep_mode, model_name = args.d_model,
+                                       gradually=args.gradually_train)
+
+        partial_model = cut_extra_layers(model_repl, max(args.replace))
         partial_model_ori = cut_extra_layers(model_ori, max(args.replace))
-        partial_model.to(device)
-        partial_model_ori.to(device)
-        
         set_requires_grad(partial_model, args.replace, args.rep_mode)
         set_requires_grad(partial_model_ori, [], args.rep_mode)
         partial_model.to(device)
-        partial_model_ori.to(device)
+        partial_model_ori.to(device) 
+           
+        print(f"Train model: {args.d_model}, target blocks:{args.replace}")
         
         ### EMA augmentation in training not implemented
         n_parameters = sum(p.numel() for p in partial_model.parameters() if p.requires_grad)
@@ -321,19 +334,20 @@ def main(args):
         output_dir = "/home/u17/yuxinr/block_distill/model/" + current_time.strftime("%Y-%m-%d-%H-%M") + "/"
         args.output_dir = Path(output_dir)
         args.output_dir.mkdir(parents=True, exist_ok=True)
+        print(args.output_dir)
         
         trained_model, trained_model_dict = train_model(
             args=args, mode="train", model=partial_model, teacher_model=partial_model_ori,
             criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler,
             lr_scheduler=lr_scheduler, train_data=data_loader_train, device=device,
             n_parameters=n_parameters)
-        trained_model = replace_att2mixer(model=weighted_model_ori, repl_blocks=args.replace, 
+        trained_model = replace_att2mixer(model=model_deit, repl_blocks=args.replace, 
                                           weighted_model= trained_model)
         # print(trained_model)
         save_path = args.output_dir / "replaced_model.pth"
         trained_model_dict["model"] = trained_model.state_dict()
         # torch.save(trained_model_dict, save_path)
-        torch.save(trained_model, save_path)
+        torch.save(trained_model, save_path)   
         
     elif args.finetune and not args.train and not args.eval:
         data_loader_train = load_dataset(args, "train")
@@ -416,27 +430,28 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [10]
+    repl_index = [9]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
-    args.replace = repl_index
-    args.rep_mode = "all"
-    args.epochs = 30
+    # args.replace = repl_index
+    # args.rep_mode = "qkv"
+    # args.epochs = 50
     args.lr = 5e-4
     args.batch_size = 2048
     # args.opt = "sgd"
     
     # train
-    args.data_set = "IMNET"
-    args.data_path = "/contrib/datasets/ILSVRC2012/"
+    # args.data_set = "IMNET"
+    # args.data_path = "/contrib/datasets/ILSVRC2012/"
     args.train = True
+    args.gradually_train = False
     
     # eval
     # args.data_set = "IMNET"
     # args.train = False
     # args.eval = True
-    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-10-31-17-29/finetuned_model_cosine.pth"
+    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-11-15-14-25/replaced_model.pth"
     # args.sched = "constant"
     
     # finetune

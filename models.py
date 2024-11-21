@@ -35,6 +35,35 @@ param_dict_all = {
     }
 }
 
+weight_schedule = {
+    5: 0.8, 
+    10: 0.7,
+    15: 0.6,
+    20: 0.5,
+    25: 0.4,
+    30: 0.3,
+    35: 0.2,
+    40: 0.1,
+    45: 0,
+}
+
+
+class ParallelBlock(nn.Module):
+    def __init__(self, attn_block, mixer_block, initial_weight_attention=0.9):
+        super(ParallelBlock, self).__init__()
+        self.attn_block = attn_block
+        self.mixer_block = mixer_block
+        self.attn_weight = nn.Parameter(torch.tensor(initial_weight_attention), requires_grad=False)
+        self.mixer_weight = nn.Parameter(torch.tensor(1.0 - initial_weight_attention), requires_grad=False)
+
+    def forward(self, x):
+        # Forward pass through both the attention and mixer block
+        attn_out = self.attn_block(x)
+        mixer_out = self.mixer_block(x)
+        # Weighted sum of both outputs
+        y = self.attn_weight * attn_out + self.mixer_weight * mixer_out
+        return y
+
 
 class MlpBlock(nn.Module):
     def __init__(self, input_dim, mlp_dim, dropout = 0.):
