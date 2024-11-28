@@ -1,8 +1,9 @@
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
 import os
-from torchvision import datasets, transforms
+import torch
 from timm.data import create_transform
+from torchvision import datasets, transforms
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
@@ -52,3 +53,32 @@ def build_transform(is_train, args):
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
     return transforms.Compose(t)
+
+
+def load_dataset(args, mode):
+    if mode == "train":
+        print(f"Loading training dataset {args.data_set}")
+        dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
+        return data_loader_train
+    
+    elif mode == "val":
+        print(f"Loading validation dataset {args.data_set}")
+        dataset_val, args.nb_classes = build_dataset(is_train=False, args=args)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=int(1.5 * args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
+        return data_loader_val, dataset_val
+

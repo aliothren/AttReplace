@@ -4,13 +4,12 @@ import datetime
 import argparse
 
 import numpy as np
-import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
-from datasets import build_dataset
+import models
+from datasets import load_dataset
 from train import train_model, evaluate
 from loss import CosineSimilarityLoss, CombinedLoss
-from models import MixerBlock, EmptyBlock, ParallelBlock
 
 from pathlib import Path
 from torchsummary import summary
@@ -32,13 +31,16 @@ def get_args_parser():
     parser.add_argument("--replace", nargs="+", type=int, help="list for index of blocks to be replaced")
     parser.add_argument("--rep-mode", default="all", choices=["qkv", "all"], 
                         help="Choose to relace whole attention block or only qkv part")
-    parser.add_argument("--qkv-ft", default="", choices=["", "FC", "block"])
+    parser.add_argument("--qkv-ft-mode", default="", choices=["", "FC", "block"])
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
     parser.add_argument("--gradually-train", action="store_true", help="Gradually distill weight from teacher to student")
+    parser.add_argument('--train-in-eval', action='store_true', help='Set not training blocks into eval mode')
     parser.add_argument('--finetune', action='store_true', help='Finetuning the whole model')
     parser.add_argument("--ft-model", default="", help="Path of model to be finetuned")
+    parser.add_argument("--ft-mode", default="cosine", choices=["cosine", "class", "combine"],
+                        type=str, help="criterion of finetune, only used in global finetune")
     
     # data parameters
     parser.add_argument("--data-path", default="/home/u17/yuxinr/datasets/", type=str, help="dataset path")
@@ -110,142 +112,8 @@ def get_args_parser():
     parser.add_argument("--ft-epochs", default=50, type=int)
     parser.add_argument("--ft-start-epoch", default=0, type=int)
     parser.add_argument('--ft-clip-grad', type=float, default=None, metavar='NORM') 
-    parser.add_argument("--ft-mode", default="cosine", choices=["cosine", "class", "combine"],
-                        type=str, help="criterion of finetune")
     return parser
     
-
-def load_weight(model, weight):
-    if weight.startswith("https"):
-        checkpoint = torch.hub.load_state_dict_from_url(
-            weight, map_location="cpu", check_hash=True)
-    else:
-        checkpoint = torch.load(weight, map_location="cpu")
-    checkpoint_model = checkpoint["model"]
-    state_dict = model.state_dict()
-    for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
-        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-            print(f"Removing key {k} from pretrained checkpoint")
-            del checkpoint_model[k]
-            
-    # interpolate position embedding
-    pos_embed_checkpoint = checkpoint_model['pos_embed']
-    embedding_size = pos_embed_checkpoint.shape[-1]
-    num_patches = model.patch_embed.num_patches
-    num_extra_tokens = model.pos_embed.shape[-2] - num_patches
-    # height (== width) for the checkpoint position embedding
-    orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-    # height (== width) for the new position embedding
-    new_size = int(num_patches ** 0.5)
-    # class_token and dist_token are kept unchanged
-    extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-    # only the position tokens are interpolated
-    pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-    pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-    pos_tokens = torch.nn.functional.interpolate(
-        pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-    pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-    new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-    checkpoint_model['pos_embed'] = new_pos_embed
-    
-    missing_keys, unexpected_keys = model.load_state_dict(checkpoint_model, strict=False)
-    # print("Missing keys:", missing_keys)
-    # print("Unexpected keys:", unexpected_keys)
-    return model
-
-    
-def replace_att2mixer(model, repl_blocks, model_name = "", mode = "all", 
-                      weighted_model = None, gradually = False):
-    for blk_index in repl_blocks:
-        
-        if weighted_model == None:
-            if mode == "all":
-                repl_block = MixerBlock(mode, model_name)
-            elif mode == "qkv":
-                mlp_block = MixerBlock(mode, model_name)
-                repl_block = copy.deepcopy(model.blocks[blk_index])
-                repl_block.attn = mlp_block
-            else:
-                raise NotImplementedError("Not available replace method")
-            
-            if gradually:
-                attn_block = copy.deepcopy(model.blocks[blk_index])
-                repl_block = ParallelBlock(attn_block, repl_block)
-                
-            repl_block.to("cuda")
-            model.blocks[blk_index] = repl_block
-            
-        else:
-            if gradually:
-                model.blocks[blk_index] = weighted_model.blocks[blk_index].mixer_block
-            else:
-                model.blocks[blk_index] = weighted_model.blocks[blk_index]
-
-    return model
-
-
-def cut_extra_layers(model, max_index, depth = 12):
-    for index in range(max_index + 1, depth):
-        model.blocks[index] = EmptyBlock()
-    model.norm = nn.Identity()
-    model.fc_norm = nn.Identity()
-    model.head_drop = nn.Identity()
-    model.head = nn.Identity()
-    return model
-
-
-def set_requires_grad(model, targets, mode, trainable=True):
-    target_names = [f"blocks.{target}" for target in targets]
-    for name, param in model.named_parameters():
-        # print(name)
-        if mode == "finetune":
-            param.requires_grad = trainable
-            
-        elif any(target in name for target in target_names):
-            if mode == "qkv":
-                if "mlp" in name:
-                    param.requires_grad = not trainable
-                else:
-                    param.requires_grad = trainable
-            elif mode == "all":
-                param.requires_grad = trainable
-            else:
-                raise NotImplementedError("Not available replace method")
-            
-            if "attn_weight" in name or "mixer_weight" in name or "attn_block" in name:
-                param.requires_grad = not trainable
-                
-        else:
-            param.requires_grad = not trainable
-
-
-def load_dataset(args, mode):
-    if mode == "train":
-        print(f"Loading training dataset {args.data_set}")
-        dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        data_loader_train = torch.utils.data.DataLoader(
-            dataset_train, sampler=sampler_train,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=True,
-        )
-        return data_loader_train
-    
-    elif mode == "val":
-        print(f"Loading validation dataset {args.data_set}")
-        dataset_val, args.nb_classes = build_dataset(is_train=False, args=args)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-        data_loader_val = torch.utils.data.DataLoader(
-            dataset_val, sampler=sampler_val,
-            batch_size=int(1.5 * args.batch_size),
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False
-        )
-        return data_loader_val, dataset_val
-
 
 def main(args):
     print(args)
@@ -268,22 +136,8 @@ def main(args):
         data_loader_val, dataset_val = load_dataset(args, "val")
         print(f"Evaluation model: {args.eval_model}")
         model = torch.load(args.eval_model)
-        # Using when wrong head only
-        model_deit = create_model(
-            args.d_model,
-            pretrained=False,
-            num_classes=args.nb_classes,
-            drop_rate=args.drop,
-            drop_path_rate=args.drop_path,
-            drop_block_rate=None,
-            img_size=args.input_size
-        )
-        model_head = load_weight(model_deit, args.d_weight)
-        # model_head = torch.load("/home/u17/yuxinr/block_distill/model/2024-11-01-18-22/deit_model_cifar_head.pth")
-        model.head = model_head.head
-        
         model.to(device)
-        set_requires_grad(model, [], "all")
+        models.set_requires_grad(model, "train", target_blocks=[], target_layers="all")
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
@@ -293,35 +147,36 @@ def main(args):
         print(f"Creating DeiT model: {args.d_model}")
         args.nb_classes = 1000 # if using CIFAR train imnet model
         model_deit = create_model(
-            args.d_model,
-            pretrained=False,
-            num_classes=args.nb_classes,
-            drop_rate=args.drop,
-            drop_path_rate=args.drop_path,
-            drop_block_rate=None,
-            img_size=args.input_size
-        )
-        model_deit = load_weight(model_deit, args.d_weight)
+            args.d_model, pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop,
+            drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size
+            )
+        model_deit = models.load_weight(model_deit, args.d_weight)
         model_ori = copy.deepcopy(model_deit)
         model = copy.deepcopy(model_deit)
-        print(f"Replacing blocks: {args.replace}")
-        model_repl = replace_att2mixer(model=model, repl_blocks=args.replace, 
-                                       mode=args.rep_mode, model_name = args.d_model,
-                                       gradually=args.gradually_train)
+        print(f"Replacing blocks: {args.replace}; Mode: {args.rep_mode}; Target blocks: {args.replace}")
+        model_repl = models.replace_attention(
+            model=model, repl_blocks=args.replace, model_name=args.d_model, 
+            mode=args.rep_mode, grad_train=args.gradually_train
+            )
 
-        partial_model = cut_extra_layers(model_repl, max(args.replace))
-        partial_model_ori = cut_extra_layers(model_ori, max(args.replace))
-        set_requires_grad(partial_model, args.replace, args.rep_mode)
-        set_requires_grad(partial_model_ori, [], args.rep_mode)
+        partial_model = models.cut_extra_layers(model_repl, max(args.replace))
+        partial_model_ori = models.cut_extra_layers(model_ori, max(args.replace))
+        
+        models.set_requires_grad(partial_model, "train", args.replace, args.rep_mode)
+        models.set_requires_grad(partial_model_ori, "train", [], args.rep_mode)
         partial_model.to(device)
         partial_model_ori.to(device) 
-           
-        print(f"Train model: {args.d_model}, target blocks:{args.replace}")
         
+        current_time = datetime.datetime.now()
+        output_dir = "/home/u17/yuxinr/block_distill/model/" + current_time.strftime("%Y-%m-%d-%H-%M-%S") + "/"
+        args.output_dir = Path(output_dir)
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        print(args.output_dir)  
+              
         ### EMA augmentation in training not implemented
         n_parameters = sum(p.numel() for p in partial_model.parameters() if p.requires_grad)
-        print('number of trainable params:', n_parameters)
-        
+        print(f"number of trainable params: {n_parameters}")
+
         if not args.unscale_lr:
             linear_scaled_lr = args.lr * args.batch_size / 512.0
             args.lr = linear_scaled_lr
@@ -330,50 +185,80 @@ def main(args):
         lr_scheduler, _ = create_scheduler(args, optimizer)
         criterion = CosineSimilarityLoss()
         
-        current_time = datetime.datetime.now()
-        output_dir = "/home/u17/yuxinr/block_distill/model/" + current_time.strftime("%Y-%m-%d-%H-%M") + "/"
-        args.output_dir = Path(output_dir)
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        print(args.output_dir)
-        
-        trained_model, trained_model_dict = train_model(
+        trained_partial_model, trained_model_dict = train_model(
             args=args, mode="train", model=partial_model, teacher_model=partial_model_ori,
-            criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler,
-            lr_scheduler=lr_scheduler, train_data=data_loader_train, device=device,
-            n_parameters=n_parameters)
-        trained_model = replace_att2mixer(model=model_deit, repl_blocks=args.replace, 
-                                          weighted_model= trained_model)
-        # print(trained_model)
-        save_path = args.output_dir / "replaced_model.pth"
+            criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
+            train_data=data_loader_train, device=device, n_parameters=n_parameters
+            )
+        
+        trained_model = models.recomplete_model(
+            trained_model=trained_partial_model, origin_model=model_deit,
+            repl_blocks=args.replace, grad_train=args.gradually_train
+            )
+        save_path = args.output_dir / "model.pth"
         trained_model_dict["model"] = trained_model.state_dict()
         # torch.save(trained_model_dict, save_path)
-        torch.save(trained_model, save_path)   
+        torch.save(trained_model, save_path)  
+        
+        if args.rep_mode == "qkv":
+            print(f"Training {args.qkv_ft_mode} of QKV-trained model")
+            models.set_requires_grad(trained_partial_model, "train", args.replace, args.qkv_ft_mode)
+            args.lr = args.lr / 10
+            # args.epochs = 50
+            optimizer = create_optimizer(args, model)
+            loss_scaler = NativeScaler()
+            lr_scheduler, _ = create_scheduler(args, optimizer)
+            
+            trained_partial_model, trained_model_dict = train_model(
+                args=args, mode="train", model=trained_partial_model, teacher_model=partial_model_ori,
+                criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
+                train_data=data_loader_train, device=device, n_parameters=n_parameters
+                ) 
+            
+            trained_model = models.recomplete_model(
+                trained_model=trained_partial_model, origin_model=model_deit,
+                repl_blocks=args.replace, grad_train=args.gradually_train
+                )
+            save_path = args.output_dir / f"model_{args.qkv_ft_mode}.pth"
+            trained_model_dict["model"] = trained_model.state_dict()
+            # torch.save(trained_model_dict, save_path)
+            torch.save(trained_model, save_path)   
         
     elif args.finetune and not args.train and not args.eval:
         data_loader_train = load_dataset(args, "train")
         print(f"Finetuning model: {args.ft_model}")
         model = torch.load(args.ft_model)
-        
-        # when changing head:
-        change2cifar_head = True
-        if change2cifar_head:
-            model_head = torch.load("/home/u17/yuxinr/block_distill/model/2024-11-01-18-22/deit_model_cifar_head.pth")
-            model.head = model_head.head
-        
         model.to(device)
-        set_requires_grad(model, list(range(len(model.blocks))), "finetune")
         
+        models.set_requires_grad(model, "finetune", list(range(len(model.blocks))))
+        if args.ft_mode == "class":
+            criterion = torch.nn.CrossEntropyLoss()
+            teacher = None
+        else:
+            model_deit = create_model(
+                args.d_model, pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop,
+                drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size
+                )
+            teacher = models.load_weight(model_deit, args.d_weight)
+            teacher.to(device)
+            if args.ft_mode == "cosine":
+                criterion = CosineSimilarityLoss()
+            elif args.ft_mode == "combine":
+                criterion == CombinedLoss()
+            else:
+                raise ValueError("Wrong finetune mode.") 
+     
+        args.output_dir = Path(args.ft_model[:-18])  
+        save_path = args.output_dir / f"model_{args.ft_mode}_ft.pth"
         n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print('number of finetunable params:', n_parameters)
         
         args.unscale_lr = args.ft_unscale_lr
         args.lr = args.ft_lr
         args.batch_size = args.ft_batch_size
-        args.output_dir = Path(args.ft_model[:-18])
         args.epochs = args.ft_epochs
         args.start_epoch = args.ft_start_epoch
         args.clip_grad = args.ft_clip_grad
-        # args.sched = "constant"
         
         if not args.unscale_lr:
             linear_scaled_lr = args.lr * args.batch_size / 512.0
@@ -381,41 +266,12 @@ def main(args):
         optimizer = create_optimizer(args, model)
         loss_scaler = NativeScaler()
         lr_scheduler, _ = create_scheduler(args, optimizer)
-        
-        if args.ft_mode == "class":
-            criterion = torch.nn.CrossEntropyLoss()
-            teacher = None
-            
-        else:
-            model_deit = create_model(
-                args.d_model,
-                pretrained=False,
-                num_classes=args.nb_classes,
-                drop_rate=args.drop,
-                drop_path_rate=args.drop_path,
-                drop_block_rate=None,
-                img_size=args.input_size
-            )
-            teacher = load_weight(model_deit, args.d_weight)
-            teacher.to(device)
-            if change2cifar_head:
-                teacher.head = model_head.head
-        
-            if args.ft_mode == "cosine":
-                criterion = CosineSimilarityLoss()
-            elif args.ft_mode == "combine":
-                criterion == CombinedLoss()
-            else:
-                raise ValueError("Wrong finetune mode.") 
-                
         finetuned_model, finetuned_model_dict = train_model(
-            args=args, mode=args.ft_mode, model=model, teacher_model=teacher,
-            criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler,
-            lr_scheduler=lr_scheduler, train_data=data_loader_train, device=device,
-            n_parameters=n_parameters)
+            args=args, mode=args.ft_mode, model=model, teacher_model=teacher, criterion=criterion, 
+            optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
+            train_data=data_loader_train, device=device, n_parameters=n_parameters
+            )
         
-        # print(trained_model)
-        save_path = args.output_dir / f"finetuned_model_{args.ft_mode}.pth"
         finetuned_model_dict["model"] = finetuned_model.state_dict()
         # torch.save(trained_model_dict, save_path)
         torch.save(finetuned_model, save_path)
@@ -430,40 +286,39 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [9]
+    repl_index = [10]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
-    # args.replace = repl_index
-    # args.rep_mode = "qkv"
-    # args.epochs = 50
+    args.replace = repl_index
+    args.rep_mode = "qkv"
+    args.qkv_ft_mode = "FC"
+    args.epochs = 5
     args.lr = 5e-4
     args.batch_size = 2048
-    # args.opt = "sgd"
     
     # train
     # args.data_set = "IMNET"
     # args.data_path = "/contrib/datasets/ILSVRC2012/"
     args.train = True
-    args.gradually_train = False
+    # args.gradually_train = False
     
     # eval
     # args.data_set = "IMNET"
     # args.train = False
     # args.eval = True
-    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-11-15-14-25/replaced_model.pth"
+    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-11-20-16-12/replaced_model_qkvFC_ft.pth"
     # args.sched = "constant"
     
     # finetune
     # args.data_set = "CIFAR"
     # args.train = False
     # args.finetune = True
-    # args.ft_model = "/home/u17/yuxinr/block_distill/model/2024-10-31-17-29/replaced_model.pth"
+    # # args.ft_model = "/home/u17/yuxinr/block_distill/model/2024-11-19-19-11/replaced_model.pth"
     # args.ft_lr = 5e-5
     # args.ft_mode = "cosine"
-    # # args.data_path = "/contrib/datasets/ILSVRC2012/"
+    # # # args.data_path = "/contrib/datasets/ILSVRC2012/"
     # args.ft_epochs = 50
         
     main(args)
-    # train_head(args)
  

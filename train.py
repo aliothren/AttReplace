@@ -3,14 +3,24 @@ import math
 import time
 import json
 import torch
-import datetime
-
 import utils
+import datetime
 
 from typing import Iterable
 from timm.utils import accuracy
 
-from models import weight_schedule
+
+weight_schedule = {
+    5: 0.8, 
+    10: 0.7,
+    15: 0.6,
+    20: 0.5,
+    25: 0.4,
+    30: 0.3,
+    35: 0.2,
+    40: 0.1,
+    45: 0,
+}
 
 
 def adjust_weights(epoch, parallel_block, weight_schedule):
@@ -120,10 +130,12 @@ def train_model(args, mode, model, teacher_model,
         print(f"Start finetuning for {args.epochs} epochs")
     
     teacher_model.eval()
-    # model.eval()
-    # for blk in args.replace:
-    #     model.blocks[blk].train()
-    model.train()    
+    if args.train_in_eval:
+        model.eval()
+        for blk in args.replace:
+            model.blocks[blk].train()
+    else:
+        model.train()    
         
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):

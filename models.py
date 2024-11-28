@@ -1,8 +1,7 @@
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from torchsummary import summary
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,19 +33,6 @@ param_dict_all = {
         "channels_hid_dim": 3072,
     }
 }
-
-weight_schedule = {
-    5: 0.8, 
-    10: 0.7,
-    15: 0.6,
-    20: 0.5,
-    25: 0.4,
-    30: 0.3,
-    35: 0.2,
-    40: 0.1,
-    45: 0,
-}
-
 
 class ParallelBlock(nn.Module):
     def __init__(self, attn_block, mixer_block, initial_weight_attention=0.9):
@@ -122,70 +108,116 @@ class MixerBlock(nn.Module):
         return x
             
 
-class MlpMixer(nn.Module):
-    """Mixer architecture."""
-    """
-    Note that this class cannot be directly use as a MLP Mixer network,
-    because the extra token cause a change in parameter num, but doesn't change the input dim.
-    """
-    def __init__(self, 
-                 in_channels = 3,
-                 patch_size = 16,
-                 img_size = 224,
-                 num_classes = 100,
-                 num_blocks = 8,
-                 channel_dim = 768,
-                 token_hid_dim = 3072,
-                 channel_hid_dim = 3072,
-                 extra_token = True
-                 ):
-        super(MlpMixer, self).__init__()
-        
-        self.num_patches = (img_size // patch_size) ** 2
-        self.num_classes = num_classes
-        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=channel_dim, kernel_size=patch_size, stride=patch_size)
-
-        if extra_token:
-            self.num_tokens = self.num_patches + 1 
-        else:
-            self.extra_token = None
-            self.num_tokens = self.num_patches
-        
-        self.blocks = nn.ModuleList([])
-        for _ in range(num_blocks):
-            block = MixerBlock(self.num_tokens, token_hid_dim, channel_dim, channel_hid_dim)
-            self.blocks.append(block)
+def load_weight(model, weight):
+    if weight.startswith("https"):
+        checkpoint = torch.hub.load_state_dict_from_url(
+            weight, map_location="cpu", check_hash=True)
+    else:
+        checkpoint = torch.load(weight, map_location="cpu")
+    checkpoint_model = checkpoint["model"]
+    state_dict = model.state_dict()
+    for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+            print(f"Removing key {k} from pretrained checkpoint")
+            del checkpoint_model[k]
             
-        self.layer_norm = nn.LayerNorm(self.num_tokens)
-        self.mlp_head = nn.Linear(self.num_tokens, num_classes)
-        
-
-    def forward(self, inputs):
-        x = self.conv(inputs)
-        x = x.flatten(2)
-        x = x.transpose(1, 2)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.layer_norm(x)
-        x = x.mean(dim=1)  # Global average pooling
-        x = self.mlp_head(x)  # Final classification layer
-        
-        return x
-
-
-class EmptyBlock(nn.Module):
-    def __init__(self):
-        super(EmptyBlock, self).__init__()
+    # interpolate position embedding
+    pos_embed_checkpoint = checkpoint_model['pos_embed']
+    embedding_size = pos_embed_checkpoint.shape[-1]
+    num_patches = model.patch_embed.num_patches
+    num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+    # height (== width) for the checkpoint position embedding
+    orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+    # height (== width) for the new position embedding
+    new_size = int(num_patches ** 0.5)
+    # class_token and dist_token are kept unchanged
+    extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+    # only the position tokens are interpolated
+    pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+    pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+    pos_tokens = torch.nn.functional.interpolate(
+        pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+    pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+    new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+    checkpoint_model['pos_embed'] = new_pos_embed
     
-    def forward(self, x):
-        return x 
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint_model, strict=False)
+    # print("Missing keys:", missing_keys)
+    # print("Unexpected keys:", unexpected_keys)
+    return model
+
+ 
+def replace_attention(model, repl_blocks, target = "mixer", model_name = "", mode = "all", 
+                      grad_train = False):
+    for blk_index in repl_blocks:
+        
+        if target == "mixer":
+            mixer_block = MixerBlock(mode, model_name)
+            
+        if mode == "all":
+            repl_block = mixer_block
+        elif mode == "qkv":
+            mlp_block = mixer_block
+            repl_block = copy.deepcopy(model.blocks[blk_index])
+            repl_block.attn = mlp_block
+        else:
+            raise NotImplementedError("Not available replace method")  
+
+        if grad_train:
+            teacher_block = copy.deepcopy(model.blocks[blk_index])
+            repl_block = ParallelBlock(teacher_block, repl_block)
+                
+        repl_block.to("cuda")
+        model.blocks[blk_index] = repl_block
     
+    return model
 
-# original_model = MixerBlock(197, 512, 768, 3072)
-# original_model.to(device)
-# print(original_model)
-# summary(original_model, (1, 197, 768))
 
+def recomplete_model(trained_model, origin_model, repl_blocks, grad_train = False):
+    for blk_index in repl_blocks:
+        if grad_train:
+            origin_model.blocks[blk_index] = trained_model.blocks[blk_index].mixer_block
+        else:
+            origin_model.blocks[blk_index] = trained_model.blocks[blk_index]
+    return origin_model
+
+
+def cut_extra_layers(model, max_index):
+    del model.blocks[max_index + 1 :]
+    # del model.norm 
+    # model.norm = nn.Identity()
+    del model.fc_norm
+    del model.head_drop
+    del model.head
+    return model
+
+
+def set_requires_grad(model, mode, target_blocks = [], target_layers = "qkv", trainable=True):
+    target_names = [f"blocks.{block}" for block in target_blocks]
+    
+    if mode == "finetune":
+        for name, param in model.named_parameters():
+            param.requires_grad = trainable
+    
+    if mode == "train":
+        # turn the whole block to trainable
+        if target_layers == "all" or target_layers == "block":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    param.requires_grad = trainable
+        # turn the replaced part to trainable
+        elif target_layers == "qkv":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    if "mlp" not in name:
+                        param.requires_grad = trainable
+        # turn the FC layers in replaced block to trainable      
+        elif target_layers == "FC":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    if "mlp" in name:
+                        param.requires_grad = trainable
 
