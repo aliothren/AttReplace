@@ -31,7 +31,7 @@ def get_args_parser():
     parser.add_argument("--replace", nargs="+", type=int, help="list for index of blocks to be replaced")
     parser.add_argument("--rep-mode", default="all", choices=["qkv", "all"], 
                         help="Choose to relace whole attention block or only qkv part")
-    parser.add_argument("--qkv-ft-mode", default="", choices=["", "FC", "block"])
+    parser.add_argument("--qkv-ft-mode", nargs="+", type=str, help="list for qkv finetune strategies")
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
@@ -102,6 +102,8 @@ def get_args_parser():
     parser.add_argument('--unscale-lr', action='store_true')
     parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
+    parser.add_argument('--qkv-ft-lr', type=float, default=5e-5, 
+                        help='qkv finetune learning rate (default: 5e-5)')
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
     
@@ -167,9 +169,15 @@ def main(args):
         partial_model.to(device)
         partial_model_ori.to(device) 
         
+        base_dir = "/home/u17/yuxinr/block_distill/model/"
         current_time = datetime.datetime.now()
-        output_dir = "/home/u17/yuxinr/block_distill/model/" + current_time.strftime("%Y-%m-%d-%H-%M-%S") + "/"
-        args.output_dir = Path(output_dir)
+        timestamp = current_time.strftime("%Y-%m-%d-%H-%M-%S")
+        args.output_dir = Path(base_dir) / timestamp
+        while args.output_dir.exists():
+            current_time += datetime.timedelta(seconds=1)  # 秒数加 1
+            timestamp = current_time.strftime("%Y-%m-%d-%H-%M-%S")
+            args.output_dir = Path(base_dir) / timestamp
+        
         args.output_dir.mkdir(parents=True, exist_ok=True)
         print(args.output_dir)  
               
@@ -180,7 +188,7 @@ def main(args):
         if not args.unscale_lr:
             linear_scaled_lr = args.lr * args.batch_size / 512.0
             args.lr = linear_scaled_lr
-        optimizer = create_optimizer(args, model)
+        optimizer = create_optimizer(args, partial_model)
         loss_scaler = NativeScaler()
         lr_scheduler, _ = create_scheduler(args, optimizer)
         criterion = CosineSimilarityLoss()
@@ -198,31 +206,32 @@ def main(args):
         save_path = args.output_dir / "model.pth"
         trained_model_dict["model"] = trained_model.state_dict()
         # torch.save(trained_model_dict, save_path)
-        torch.save(trained_model, save_path)  
+        torch.save(trained_model, save_path)
         
         if args.rep_mode == "qkv":
-            print(f"Training {args.qkv_ft_mode} of QKV-trained model")
-            models.set_requires_grad(trained_partial_model, "train", args.replace, args.qkv_ft_mode)
-            args.lr = args.lr / 10
-            # args.epochs = 50
-            optimizer = create_optimizer(args, model)
-            loss_scaler = NativeScaler()
-            lr_scheduler, _ = create_scheduler(args, optimizer)
+            for ft_mode in args.qkv_ft_mode:
+                qkv_ft_model = copy.deepcopy(trained_partial_model)
+                print(f"Training {ft_mode} of QKV-trained model")
+                models.set_requires_grad(qkv_ft_model, "train", args.replace, ft_mode)
+                args.lr = args.qkv_ft_lr
+                optimizer = create_optimizer(args, qkv_ft_model)
+                loss_scaler = NativeScaler()
+                lr_scheduler, _ = create_scheduler(args, optimizer)
+
+                trained_partial_model, trained_model_dict = train_model(
+                    args=args, mode="train", model=qkv_ft_model, teacher_model=partial_model_ori,
+                    criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
+                    train_data=data_loader_train, device=device, n_parameters=n_parameters
+                    ) 
             
-            trained_partial_model, trained_model_dict = train_model(
-                args=args, mode="train", model=trained_partial_model, teacher_model=partial_model_ori,
-                criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
-                train_data=data_loader_train, device=device, n_parameters=n_parameters
-                ) 
-            
-            trained_model = models.recomplete_model(
-                trained_model=trained_partial_model, origin_model=model_deit,
-                repl_blocks=args.replace, grad_train=args.gradually_train
-                )
-            save_path = args.output_dir / f"model_{args.qkv_ft_mode}.pth"
-            trained_model_dict["model"] = trained_model.state_dict()
-            # torch.save(trained_model_dict, save_path)
-            torch.save(trained_model, save_path)   
+                trained_model = models.recomplete_model(
+                    trained_model=trained_partial_model, origin_model=model_deit,
+                    repl_blocks=args.replace, grad_train=args.gradually_train
+                    )
+                save_path = args.output_dir / f"model_{ft_mode}.pth"
+                trained_model_dict["model"] = trained_model.state_dict()
+                # torch.save(trained_model_dict, save_path)
+                torch.save(trained_model, save_path)   
         
     elif args.finetune and not args.train and not args.eval:
         data_loader_train = load_dataset(args, "train")
@@ -286,14 +295,14 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [10]
+    repl_index = [1]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
-    args.replace = repl_index
+    # args.replace = repl_index
     args.rep_mode = "qkv"
-    args.qkv_ft_mode = "FC"
-    args.epochs = 5
+    args.qkv_ft_mode = ["FC", "block"]
+    args.epochs = 50
     args.lr = 5e-4
     args.batch_size = 2048
     
