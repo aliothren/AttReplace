@@ -1,5 +1,7 @@
+import os
 import copy
 import torch
+import fcntl
 import datetime
 import argparse
 
@@ -36,6 +38,8 @@ def get_args_parser():
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
     parser.add_argument("--gradually-train", action="store_true", help="Gradually distill weight from teacher to student")
+    parser.add_argument("--grad-mode", default="linear", choices=["linear", "step", "exp", "cosine", "inverse"], 
+                        help="The scheme of weight decay in gradually training")
     parser.add_argument('--train-in-eval', action='store_true', help='Set not training blocks into eval mode')
     parser.add_argument('--finetune', action='store_true', help='Finetuning the whole model')
     parser.add_argument("--ft-model", default="", help="Path of model to be finetuned")
@@ -117,6 +121,28 @@ def get_args_parser():
     return parser
     
 
+def get_unique_output_dir(base_dir):
+    lock_file = Path(base_dir) / ".output_dir_lock"
+    lock_file.touch(exist_ok=True)
+
+    with open(lock_file, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        
+        current_time = datetime.datetime.now()
+        timestamp = current_time.strftime("%Y-%m-%d-%H-%M-%S")
+        output_dir = Path(base_dir) / timestamp
+        while output_dir.exists():
+            current_time += datetime.timedelta(seconds=1)
+            timestamp = current_time.strftime("%Y-%m-%d-%H-%M-%S")
+            output_dir = Path(base_dir) / timestamp
+        
+        output_dir.mkdir(parents=True, exist_ok=False)
+        print(f"Created directory: {output_dir}")
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+    return output_dir
+
+
 def main(args):
     print(args)
 
@@ -170,16 +196,7 @@ def main(args):
         partial_model_ori.to(device) 
         
         base_dir = "/home/u17/yuxinr/block_distill/model/"
-        current_time = datetime.datetime.now()
-        timestamp = current_time.strftime("%Y-%m-%d-%H-%M-%S")
-        args.output_dir = Path(base_dir) / timestamp
-        while args.output_dir.exists():
-            current_time += datetime.timedelta(seconds=1)  # 秒数加 1
-            timestamp = current_time.strftime("%Y-%m-%d-%H-%M-%S")
-            args.output_dir = Path(base_dir) / timestamp
-        
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        print(args.output_dir)  
+        args.output_dir = get_unique_output_dir(base_dir)
               
         ### EMA augmentation in training not implemented
         n_parameters = sum(p.numel() for p in partial_model.parameters() if p.requires_grad)
@@ -210,6 +227,7 @@ def main(args):
         
         if args.rep_mode == "qkv":
             for ft_mode in args.qkv_ft_mode:
+                args.gradually_train = False
                 qkv_ft_model = copy.deepcopy(trained_partial_model)
                 print(f"Training {ft_mode} of QKV-trained model")
                 models.set_requires_grad(qkv_ft_model, "train", args.replace, ft_mode)
@@ -302,20 +320,20 @@ if __name__ == '__main__':
     # args.replace = repl_index
     args.rep_mode = "qkv"
     args.qkv_ft_mode = ["FC", "block"]
-    args.epochs = 50
+    args.epochs = 70
     args.lr = 5e-4
     args.batch_size = 2048
     
     # train
     # args.data_set = "IMNET"
     # args.data_path = "/contrib/datasets/ILSVRC2012/"
-    args.train = True
-    # args.gradually_train = False
+    # args.train = True
+    # args.gradually_train = True
     
     # eval
-    # args.data_set = "IMNET"
-    # args.train = False
-    # args.eval = True
+    args.data_set = "IMNET"
+    args.train = False
+    args.eval = True
     # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-11-20-16-12/replaced_model_qkvFC_ft.pth"
     # args.sched = "constant"
     

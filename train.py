@@ -5,29 +5,79 @@ import json
 import torch
 import utils
 import datetime
+import numpy as np
 
 from typing import Iterable
 from timm.utils import accuracy
 
 
-weight_schedule = {
-    5: 0.8, 
-    10: 0.7,
-    15: 0.6,
-    20: 0.5,
-    25: 0.4,
-    30: 0.3,
-    35: 0.2,
-    40: 0.1,
-    45: 0,
-}
+def generate_weight_schedule(total_epochs=50, pure_student_epochs=20,
+                             scheme="linear", params=None):
+    """
+    Generate a weight schedule for teacher-student learning.
+    
+    Args:
+        total_epochs (int): Total number of training epochs (default is 50).
+        scheme (str): The decay scheme to use ("linear", "step", "exponential", "cosine", "inverse").
+        params (dict): Parameters for the chosen scheme.
+                       Example for each scheme:
+                       - "step": {"steps": [20, 40], "decay": 0.5}
+                       - "exponential": {"lambda": 0.1}
+                       - "cosine": {}
+                       - "inverse": {"alpha": 0.05}
+    
+    Returns:
+        list: A list of teacher weights for each epoch (length: total_epochs + 20).
+    """
+    if params is None:
+        params = {}
+    teacher_weights = []
+    student_weights = []
+    
+    # Add 20 epochs for pure student learning
+    epochs = total_epochs - pure_student_epochs
+    for epoch in range(epochs):
+        if scheme == "linear":
+            teacher_weight = max(0, 1 - epoch / epochs)
+        
+        elif scheme == "step":
+            interval = params.get("interval", 10)
+            decay_value = params.get("decay_value", 0.2)
+            teacher_weight = max(0, 0.95 - (epoch // interval) * decay_value)
+
+        elif scheme == "exp":
+            # Exponential decay: teacher_weight = exp(-lambda * epoch)
+            lambda_ = params.get("lambda", 0.1)
+            teacher_weight = 1 - np.exp(-lambda_ * (epochs - epoch))
+
+        elif scheme == "cosine":
+            # Cosine decay: teacher_weight = 0.5 * (1 + cos(pi * epoch / total_epochs))
+            teacher_weight = 0.5 * (1 + np.cos(np.pi * epoch / epochs))
+
+        elif scheme == "inverse":
+            # Inverse decay: teacher_weight = 1 / (1 + alpha * epoch)
+            alpha = params.get("alpha", 0.1)
+            teacher_weight = 1 / (1 + alpha * epoch)
+
+        else:
+            raise ValueError(f"Unknown scheme: {scheme}")
+
+        # Store weights
+        teacher_weights.append(teacher_weight)
+        student_weights.append(1 - teacher_weight)
+
+    # Extend with pure student learning (teacher_weight = 0)
+    teacher_weights.extend([0] * pure_student_epochs)
+    student_weights.extend([1] * pure_student_epochs)
+
+    # Return only teacher weights as requested
+    return teacher_weights
 
 
 def adjust_weights(epoch, parallel_block, weight_schedule):
-    if epoch in weight_schedule:
-        new_weight = weight_schedule[epoch]
-        parallel_block.attn_weight.data.fill_(new_weight)
-        parallel_block.mixer_weight.data.fill_(1.0 - new_weight)
+    teacher_weight = weight_schedule[epoch]
+    parallel_block.attn_weight.data.fill_(teacher_weight)
+    parallel_block.mixer_weight.data.fill_(1.0 - teacher_weight)
 
 
 @torch.no_grad()
@@ -123,8 +173,7 @@ def train_model(args, mode, model, teacher_model,
         
     if mode == "train":
         checkpoint_path = args.output_dir / "checkpoint.pth"
-        print(f"Start training for {args.epochs} epochs")
-        
+        print(f"Start training for {args.epochs} epochs")      
     else:
         checkpoint_path = args.output_dir / "ft_checkpoint.pth"
         print(f"Start finetuning for {args.epochs} epochs")
@@ -138,6 +187,8 @@ def train_model(args, mode, model, teacher_model,
         model.train()    
         
     start_time = time.time()
+    if args.gradually_train:
+        weight_schedule = generate_weight_schedule(total_epochs=args.epochs, scheme=args.grad_mode)
     for epoch in range(args.start_epoch, args.epochs):
         if args.gradually_train:
             for blk in args.replace:
