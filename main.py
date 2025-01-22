@@ -2,13 +2,13 @@ import os
 import copy
 import torch
 import fcntl
+import models
 import datetime
 import argparse
 
 import numpy as np
 import torch.backends.cudnn as cudnn
 
-import models
 from datasets import load_dataset
 from train import train_model, evaluate
 from loss import CosineSimilarityLoss, CombinedLoss
@@ -236,19 +236,20 @@ def main(args):
                 loss_scaler = NativeScaler()
                 lr_scheduler, _ = create_scheduler(args, optimizer)
 
-                trained_partial_model, trained_model_dict = train_model(
+                args.epochs = args.ft_epochs
+                fted_partial_model, fted_model_dict = train_model(
                     args=args, mode="train", model=qkv_ft_model, teacher_model=partial_model_ori,
                     criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
                     train_data=data_loader_train, device=device, n_parameters=n_parameters
                     ) 
             
                 trained_model = models.recomplete_model(
-                    trained_model=trained_partial_model, origin_model=model_deit,
+                    trained_model=fted_partial_model, origin_model=model_deit,
                     repl_blocks=args.replace, grad_train=args.gradually_train
                     )
                 save_path = args.output_dir / f"model_{ft_mode}.pth"
-                trained_model_dict["model"] = trained_model.state_dict()
-                # torch.save(trained_model_dict, save_path)
+                fted_model_dict["model"] = trained_model.state_dict()
+                # torch.save(fted_model_dict, save_path)
                 torch.save(trained_model, save_path)   
         
     elif args.finetune and not args.train and not args.eval:
@@ -307,6 +308,33 @@ def main(args):
         raise ValueError("Please specify running mode (eval/train/finetune).") 
 
 
+def eval_trained_models(args):
+    
+    torch.cuda.empty_cache()
+    args.data_set = "IMNET"
+    args.data_path = "/contrib/datasets/ILSVRC2012/"
+    args.train = False
+    args.eval = True
+    
+    args.eval_model = args.output_dir / "model.pth"
+    if os.path.exists(args.eval_model):
+        torch.cuda.empty_cache()
+        print("evaluating NO FT")
+        main(args)
+        
+    args.eval_model = args.output_dir / "model_FC.pth"
+    if os.path.exists(args.eval_model):
+        torch.cuda.empty_cache()
+        print("evaluating FC FT")
+        main(args)
+        
+    args.eval_model = args.output_dir / "model_block.pth"
+    if os.path.exists(args.eval_model):
+        torch.cuda.empty_cache()
+        print("evaluating BLOCK FT")
+        main(args)
+        
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("DeiT -> MLP Mixer", parents=[get_args_parser()])
     args = parser.parse_args()
@@ -320,20 +348,20 @@ if __name__ == '__main__':
     # args.replace = repl_index
     args.rep_mode = "qkv"
     args.qkv_ft_mode = ["FC", "block"]
-    args.epochs = 70
+    # args.epochs = 50
     args.lr = 5e-4
     args.batch_size = 2048
     
     # train
     # args.data_set = "IMNET"
     # args.data_path = "/contrib/datasets/ILSVRC2012/"
-    # args.train = True
+    args.train = True
     # args.gradually_train = True
     
     # eval
-    args.data_set = "IMNET"
-    args.train = False
-    args.eval = True
+    # args.data_set = "IMNET"
+    # args.train = False
+    # args.eval = True
     # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-11-20-16-12/replaced_model_qkvFC_ft.pth"
     # args.sched = "constant"
     
@@ -348,4 +376,4 @@ if __name__ == '__main__':
     # args.ft_epochs = 50
         
     main(args)
- 
+    eval_trained_models(args)
