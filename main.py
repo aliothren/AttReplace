@@ -31,7 +31,7 @@ def get_args_parser():
     
     # mixer model parameters
     parser.add_argument("--replace", nargs="+", type=int, help="list for index of blocks to be replaced")
-    parser.add_argument("--rep-mode", default="all", choices=["qkv", "all"], 
+    parser.add_argument("--rep-mode", default="mixer", choices=["mixer", "lstm"], 
                         help="Choose to relace whole attention block or only qkv part")
     parser.add_argument("--qkv-ft-mode", nargs="+", type=str, help="list for qkv finetune strategies")
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
@@ -99,8 +99,7 @@ def get_args_parser():
     parser.add_argument('--pin-mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.set_defaults(pin_mem=True)
-    parser.add_argument('--train-mode', action='store_true')
-    parser.set_defaults(train_mode=True)
+    parser.add_argument('--rm-shortcut', action='store_true')
     
     # Learning rate schedule parameters
     parser.add_argument('--unscale-lr', action='store_true')
@@ -181,10 +180,12 @@ def main(args):
         model_deit = models.load_weight(model_deit, args.d_weight)
         model_ori = copy.deepcopy(model_deit)
         model = copy.deepcopy(model_deit)
-        print(f"Replacing blocks: {args.replace}; Mode: {args.rep_mode}; Target blocks: {args.replace}")
+        print(f"Replacing blocks: {args.replace}; Replace by: {args.rep_mode}")
+        model_ori = models.replace_attention(
+            model=model_ori, repl_blocks=args.replace, target="attn", remove_sc=args.rm_shortcut)
         model_repl = models.replace_attention(
-            model=model, repl_blocks=args.replace, model_name=args.d_model, 
-            mode=args.rep_mode, grad_train=args.gradually_train
+            model=model, repl_blocks=args.replace, target=args.rep_mode, remove_sc=args.rm_shortcut,
+            model_name=args.d_model, grad_train=args.gradually_train
             )
 
         partial_model = models.cut_extra_layers(model_repl, max(args.replace))
@@ -217,40 +218,38 @@ def main(args):
             )
         
         trained_model = models.recomplete_model(
-            trained_model=trained_partial_model, origin_model=model_deit,
-            repl_blocks=args.replace, grad_train=args.gradually_train
+            trained_model=trained_partial_model, origin_model=model_deit, repl_blocks=args.replace, 
+            grad_train=args.gradually_train, remove_sc=args.rm_shortcut
             )
         save_path = args.output_dir / "model.pth"
         trained_model_dict["model"] = trained_model.state_dict()
         # torch.save(trained_model_dict, save_path)
         torch.save(trained_model, save_path)
         
-        if args.rep_mode == "qkv":
-            for ft_mode in args.qkv_ft_mode:
-                args.gradually_train = False
-                qkv_ft_model = copy.deepcopy(trained_partial_model)
-                print(f"Training {ft_mode} of QKV-trained model")
-                models.set_requires_grad(qkv_ft_model, "train", args.replace, ft_mode)
-                args.lr = args.qkv_ft_lr
-                optimizer = create_optimizer(args, qkv_ft_model)
-                loss_scaler = NativeScaler()
-                lr_scheduler, _ = create_scheduler(args, optimizer)
-
-                args.epochs = args.ft_epochs
-                fted_partial_model, fted_model_dict = train_model(
-                    args=args, mode="train", model=qkv_ft_model, teacher_model=partial_model_ori,
-                    criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
-                    train_data=data_loader_train, device=device, n_parameters=n_parameters
-                    ) 
-            
-                trained_model = models.recomplete_model(
-                    trained_model=fted_partial_model, origin_model=model_deit,
-                    repl_blocks=args.replace, grad_train=args.gradually_train
-                    )
-                save_path = args.output_dir / f"model_{ft_mode}.pth"
-                fted_model_dict["model"] = trained_model.state_dict()
-                # torch.save(fted_model_dict, save_path)
-                torch.save(trained_model, save_path)   
+        for ft_mode in args.qkv_ft_mode:
+            args.gradually_train = False
+            qkv_ft_model = copy.deepcopy(trained_partial_model)
+            print(f"Training {ft_mode} of QKV-trained model")
+            models.set_requires_grad(qkv_ft_model, "train", args.replace, ft_mode)
+            args.lr = args.qkv_ft_lr
+            optimizer = create_optimizer(args, qkv_ft_model)
+            loss_scaler = NativeScaler()
+            lr_scheduler, _ = create_scheduler(args, optimizer)
+            args.epochs = args.ft_epochs
+            fted_partial_model, fted_model_dict = train_model(
+                args=args, mode="train", model=qkv_ft_model, teacher_model=partial_model_ori,
+                criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
+                train_data=data_loader_train, device=device, n_parameters=n_parameters
+                ) 
+        
+            trained_model = models.recomplete_model(
+                trained_model=fted_partial_model, origin_model=model_deit, repl_blocks=args.replace,
+                grad_train=args.gradually_train, remove_sc=args.rm_shortcut
+                )
+            save_path = args.output_dir / f"model_{ft_mode}.pth"
+            fted_model_dict["model"] = trained_model.state_dict()
+            # torch.save(fted_model_dict, save_path)
+            torch.save(trained_model, save_path)   
         
     elif args.finetune and not args.train and not args.eval:
         data_loader_train = load_dataset(args, "train")
@@ -346,11 +345,11 @@ if __name__ == '__main__':
     args.d_model = deit_model
     args.d_weight = deit_weight
     # args.replace = repl_index
-    args.rep_mode = "qkv"
-    args.qkv_ft_mode = ["FC", "block"]
+    args.qkv_ft_mode = ["block"]
     # args.epochs = 50
     args.lr = 5e-4
     args.batch_size = 2048
+    # args.rm_shortcut = True
     
     # train
     # args.data_set = "IMNET"

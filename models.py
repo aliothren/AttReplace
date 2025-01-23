@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-param_dict_qkv = {
+param_dict_mixer = {
     "deit_tiny_patch16_224":{
         "num_patches": 197,
         "token_hid_dim": 384,
@@ -18,21 +18,6 @@ param_dict_qkv = {
     }
 }
 
-param_dict_all = {
-    "deit_tiny_patch16_224":{
-        "num_patches": 197,
-        "token_hid_dim": 512,
-        "channels_dim": 192,
-        "channels_hid_dim": 512,
-    },
-   
-    "deit_base_patch16_224":{ # to be determined
-        "num_patches": 197,
-        "token_hid_dim": 3072,
-        "channels_dim": 768,
-        "channels_hid_dim": 3072,
-    }
-}
 
 class ParallelBlock(nn.Module):
     def __init__(self, attn_block, mixer_block, initial_weight_attention=0.9):
@@ -70,43 +55,57 @@ class MlpBlock(nn.Module):
 
 class MixerBlock(nn.Module):
     """This is the mixer block to replace attention module"""
-    def __init__(self, mode, model_name, dropout = 0. ):
+    def __init__(self, model_name, dropout = 0. ):
         super(MixerBlock, self).__init__()
-        self.mode = mode
-        if mode == "qkv":
-            self.param_dict = param_dict_qkv
-        else:
-            self.param_dict = param_dict_all
-            
+        
+        self.param_dict = param_dict_mixer
         self.token_mixing = MlpBlock(self.param_dict[model_name]["num_patches"],
                                      self.param_dict[model_name]["token_hid_dim"],
                                      dropout)
-        if mode == "all":
-            self.channel_mixing = MlpBlock(self.param_dict[model_name]["channels_dim"],
-                                           self.param_dict[model_name]["channels_hid_dim"],
-                                           dropout)
-            self.norm1 = nn.LayerNorm(self.param_dict[model_name]["channels_dim"])
-            self.norm2 = nn.LayerNorm(self.param_dict[model_name]["channels_dim"])
         
     def forward(self, x):
         # Token mixing
-        if self.mode == "all":
-            y = self.norm1(x)
-        else:
-            y = x
-            
+        y = x
         y = y.transpose(1, 2)
         y = self.token_mixing(y)
         y = y.transpose(1, 2)
-        x = x + y
         
-        if self.mode == "all":
-            y = self.norm2(x)
-            y = self.channel_mixing(y)
-            x = x + y
-        
+        return y
+
+
+class AttnBlockNoSC(nn.Module):
+    """DeiT Block without shortcut"""
+    def __init__(self, original_block):
+        super(AttnBlockNoSC, self).__init__()
+        self.attn = original_block.attn
+        self.mlp = original_block.mlp
+        self.norm1 = original_block.norm1
+        self.norm2 = original_block.norm2
+
+    def forward(self, x):
+        x = self.norm1(x)
+        x = self.attn(x)
+        x = self.norm2(x)
+        x = self.mlp(x)
         return x
-            
+
+
+class AttnBlockWithSC(nn.Module):
+    """DeiT Block with shortcut"""
+    def __init__(self, original_block):
+        super(AttnBlockNoSC, self).__init__()
+        self.attn = original_block.attn
+        self.mlp = original_block.mlp
+        self.norm1 = original_block.norm1
+        self.norm2 = original_block.norm2
+
+    def forward(self, x):
+        y = self.norm1(x)
+        x = x + self.attn(y)
+        y = self.norm2(x)
+        x = x + self.mlp(y)
+        return x      
+      
 
 def load_weight(model, weight):
     if weight.startswith("https"):
@@ -146,18 +145,30 @@ def load_weight(model, weight):
     # print("Unexpected keys:", unexpected_keys)
     return model
 
- 
-def replace_attention(model, repl_blocks, target = "mixer", model_name = "", mode = "all", 
-                      grad_train = False):
+
+# Remove shortcut to avoid gradiant vanish in training
+def remove_shortcut(block):
+    block = AttnBlockNoSC(block)
+    return block
+    
+
+# Add shortcut to recover network structure for inference
+def recover_shortcut(block):
+    block = AttnBlockWithSC(block)
+    return  block
+
+    
+def replace_attention(model, repl_blocks, target = None, remove_sc = False,
+                      model_name = "", grad_train = False):
     for blk_index in repl_blocks:
         
-        if target == "mixer":
-            mixer_block = MixerBlock(mode, model_name)
-            
-        if mode == "all":
-            repl_block = mixer_block
-        elif mode == "qkv":
-            mlp_block = mixer_block
+        if remove_sc:
+            model.blocks[blk_index] = remove_shortcut(model.blocks[blk_index])
+        
+        if target == "attn":
+            continue
+        elif target == "mixer":
+            mlp_block = MixerBlock(model_name)
             repl_block = copy.deepcopy(model.blocks[blk_index])
             repl_block.attn = mlp_block
         else:
@@ -173,12 +184,17 @@ def replace_attention(model, repl_blocks, target = "mixer", model_name = "", mod
     return model
 
 
-def recomplete_model(trained_model, origin_model, repl_blocks, grad_train = False):
+def recomplete_model(trained_model, origin_model, repl_blocks, 
+                     grad_train = False, remove_sc = False):
     for blk_index in repl_blocks:
         if grad_train:
             origin_model.blocks[blk_index] = trained_model.blocks[blk_index].mixer_block
         else:
             origin_model.blocks[blk_index] = trained_model.blocks[blk_index]
+        
+        # recover removed shortcuts
+        if remove_sc:
+            origin_model.blocks[blk_index] = recover_shortcut(origin_model.blocks[blk_index])
     return origin_model
 
 
@@ -192,7 +208,7 @@ def cut_extra_layers(model, max_index):
     return model
 
 
-def set_requires_grad(model, mode, target_blocks = [], target_layers = "qkv", trainable=True):
+def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", trainable=True):
     target_names = [f"blocks.{block}" for block in target_blocks]
     
     if mode == "finetune":
@@ -201,13 +217,13 @@ def set_requires_grad(model, mode, target_blocks = [], target_layers = "qkv", tr
     
     if mode == "train":
         # turn the whole block to trainable
-        if target_layers == "all" or target_layers == "block":
+        if target_layers == "block":
             for name, param in model.named_parameters():
                 param.requires_grad = not trainable
                 if any(target in name for target in target_names):
                     param.requires_grad = trainable
-        # turn the replaced part to trainable
-        elif target_layers == "qkv":
+        # turn the replaced MLP-Mixer to trainable
+        elif target_layers == "mixer":
             for name, param in model.named_parameters():
                 param.requires_grad = not trainable
                 if any(target in name for target in target_names):
