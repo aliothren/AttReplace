@@ -5,5 +5,7 @@ main_3.py
 main_4.py
 train_1.py
 models_1.py
+models_2.py
+models_3.py
 __pycache__/
 *slurm*

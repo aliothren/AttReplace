@@ -168,7 +168,7 @@ def main(args):
         models.set_requires_grad(model, "train", target_blocks=[], target_layers="all")
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        del model
+        del model, data_loader_val, dataset_val
         gc.collect()
         torch.cuda.empty_cache()
         
@@ -265,7 +265,7 @@ def main(args):
             fted_model_dict["model"] = trained_model.state_dict()
             # torch.save(fted_model_dict, save_path)
             torch.save(trained_model, save_path)   
-            del optimizer, trained_model, model_deit, partial_model_ori
+            del optimizer, trained_model, model_deit, partial_model_ori, data_loader_train
             gc.collect()
             torch.cuda.empty_cache()
         
@@ -324,8 +324,6 @@ def main(args):
     else:
         raise ValueError("Please specify running mode (eval/train/finetune).") 
     
-    
-
 
 def eval_trained_models(args):
     args.data_set = "IMNET"
@@ -355,22 +353,19 @@ if __name__ == '__main__':
     
     deit_model = "deit_tiny_patch16_224"
     deit_weight = "https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth"
-    repl_index = [1]
     
     args.d_model = deit_model
     args.d_weight = deit_weight
-    # args.replace = repl_index
     args.qkv_ft_mode = ["block"]
-    # args.epochs = 50
     args.lr = 5e-4
     args.batch_size = 2048
-    # args.rm_shortcut = True
     
     # train
     # args.data_set = "IMNET"
     # args.data_path = "/contrib/datasets/ILSVRC2012/"
     args.train = True
     # args.gradually_train = True
+    # args.rm_shortcut = True
     
     # eval
     # args.data_set = "IMNET"
