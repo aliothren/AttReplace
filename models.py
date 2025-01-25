@@ -20,17 +20,17 @@ param_dict_mixer = {
 
 
 class ParallelBlock(nn.Module):
-    def __init__(self, attn_block, mixer_block, initial_weight_attention=0.9):
+    def __init__(self, teacher_block, student_block, initial_weight_attention=0.9):
         super(ParallelBlock, self).__init__()
-        self.attn_block = attn_block
-        self.mixer_block = mixer_block
+        self.teacher_block = teacher_block
+        self.student_block = student_block
         self.attn_weight = nn.Parameter(torch.tensor(initial_weight_attention), requires_grad=False)
         self.mixer_weight = nn.Parameter(torch.tensor(1.0 - initial_weight_attention), requires_grad=False)
 
     def forward(self, x):
         # Forward pass through both the attention and mixer block
-        attn_out = self.attn_block(x)
-        mixer_out = self.mixer_block(x)
+        attn_out = self.teacher_block(x)
+        mixer_out = self.student_block(x)
         # Weighted sum of both outputs
         y = self.attn_weight * attn_out + self.mixer_weight * mixer_out
         return y
@@ -85,15 +85,15 @@ class AttnBlockNoSC(nn.Module):
     def forward(self, x):
         x = self.norm1(x)
         x = self.attn(x)
-        x = self.norm2(x)
-        x = self.mlp(x)
+        # x = self.norm2(x)
+        # x = self.mlp(x)
         return x
 
 
 class AttnBlockWithSC(nn.Module):
     """DeiT Block with shortcut"""
     def __init__(self, original_block):
-        super(AttnBlockNoSC, self).__init__()
+        super(AttnBlockWithSC, self).__init__()
         self.attn = original_block.attn
         self.mlp = original_block.mlp
         self.norm1 = original_block.norm1
@@ -188,7 +188,7 @@ def recomplete_model(trained_model, origin_model, repl_blocks,
                      grad_train = False, remove_sc = False):
     for blk_index in repl_blocks:
         if grad_train:
-            origin_model.blocks[blk_index] = trained_model.blocks[blk_index].mixer_block
+            origin_model.blocks[blk_index] = trained_model.blocks[blk_index].student_block
         else:
             origin_model.blocks[blk_index] = trained_model.blocks[blk_index]
         
@@ -200,11 +200,12 @@ def recomplete_model(trained_model, origin_model, repl_blocks,
 
 def cut_extra_layers(model, max_index):
     del model.blocks[max_index + 1 :]
-    # del model.norm 
-    # model.norm = nn.Identity()
-    del model.fc_norm
-    del model.head_drop
-    del model.head
+    try:
+        del model.fc_norm
+        del model.head_drop
+        del model.head
+    except:
+        print("Model head not deleted")
     return model
 
 

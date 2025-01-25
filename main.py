@@ -1,4 +1,5 @@
 import os
+import gc
 import copy
 import torch
 import fcntl
@@ -167,6 +168,9 @@ def main(args):
         models.set_requires_grad(model, "train", target_blocks=[], target_layers="all")
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
         
     elif args.train and not args.eval and not args.finetune:
         data_loader_train = load_dataset(args, "train")
@@ -190,7 +194,6 @@ def main(args):
 
         partial_model = models.cut_extra_layers(model_repl, max(args.replace))
         partial_model_ori = models.cut_extra_layers(model_ori, max(args.replace))
-        
         models.set_requires_grad(partial_model, "train", args.replace, args.rep_mode)
         models.set_requires_grad(partial_model_ori, "train", [], args.rep_mode)
         partial_model.to(device)
@@ -217,20 +220,31 @@ def main(args):
             train_data=data_loader_train, device=device, n_parameters=n_parameters
             )
         
+        complete_model = copy.deepcopy(model_deit)
         trained_model = models.recomplete_model(
-            trained_model=trained_partial_model, origin_model=model_deit, repl_blocks=args.replace, 
+            trained_model=trained_partial_model, origin_model=complete_model, repl_blocks=args.replace, 
             grad_train=args.gradually_train, remove_sc=args.rm_shortcut
             )
         save_path = args.output_dir / "model.pth"
         trained_model_dict["model"] = trained_model.state_dict()
         # torch.save(trained_model_dict, save_path)
         torch.save(trained_model, save_path)
+        del optimizer
+        gc.collect()
+        torch.cuda.empty_cache()
         
         for ft_mode in args.qkv_ft_mode:
             args.gradually_train = False
-            qkv_ft_model = copy.deepcopy(trained_partial_model)
-            print(f"Training {ft_mode} of QKV-trained model")
+            
+            qkv_ft_model = models.cut_extra_layers(trained_model, max(args.replace))
+            model_ori = copy.deepcopy(model_deit)
+            partial_model_ori = models.cut_extra_layers(model_ori, max(args.replace))
             models.set_requires_grad(qkv_ft_model, "train", args.replace, ft_mode)
+            models.set_requires_grad(partial_model_ori, "train", [], args.rep_mode)
+            qkv_ft_model.to(device)
+            partial_model_ori.to(device)
+            
+            print(f"Training {ft_mode} of QKV-trained model")
             args.lr = args.qkv_ft_lr
             optimizer = create_optimizer(args, qkv_ft_model)
             loss_scaler = NativeScaler()
@@ -241,15 +255,19 @@ def main(args):
                 criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
                 train_data=data_loader_train, device=device, n_parameters=n_parameters
                 ) 
-        
+            
+            complete_model = copy.deepcopy(model_deit)
             trained_model = models.recomplete_model(
-                trained_model=fted_partial_model, origin_model=model_deit, repl_blocks=args.replace,
-                grad_train=args.gradually_train, remove_sc=args.rm_shortcut
+                trained_model=fted_partial_model, origin_model=complete_model, repl_blocks=args.replace,
+                grad_train=args.gradually_train, remove_sc=False
                 )
             save_path = args.output_dir / f"model_{ft_mode}.pth"
             fted_model_dict["model"] = trained_model.state_dict()
             # torch.save(fted_model_dict, save_path)
             torch.save(trained_model, save_path)   
+            del optimizer, trained_model, model_deit, partial_model_ori
+            gc.collect()
+            torch.cuda.empty_cache()
         
     elif args.finetune and not args.train and not args.eval:
         data_loader_train = load_dataset(args, "train")
@@ -305,31 +323,28 @@ def main(args):
         
     else:
         raise ValueError("Please specify running mode (eval/train/finetune).") 
+    
+    
 
 
 def eval_trained_models(args):
-    
-    torch.cuda.empty_cache()
     args.data_set = "IMNET"
-    args.data_path = "/contrib/datasets/ILSVRC2012/"
+    args.data_path = "/home/u17/yuxinr/datasets/"
     args.train = False
     args.eval = True
     
     args.eval_model = args.output_dir / "model.pth"
     if os.path.exists(args.eval_model):
-        torch.cuda.empty_cache()
         print("evaluating NO FT")
         main(args)
         
     args.eval_model = args.output_dir / "model_FC.pth"
     if os.path.exists(args.eval_model):
-        torch.cuda.empty_cache()
         print("evaluating FC FT")
         main(args)
         
     args.eval_model = args.output_dir / "model_block.pth"
     if os.path.exists(args.eval_model):
-        torch.cuda.empty_cache()
         print("evaluating BLOCK FT")
         main(args)
         
