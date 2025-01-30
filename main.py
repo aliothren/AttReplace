@@ -110,6 +110,9 @@ def get_args_parser():
                         help='qkv finetune learning rate (default: 5e-5)')
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
+    parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
+    parser.add_argument('--warmup-lr', type=float, default=1e-6, help='Warm-up initial learning rate')
+
     
     # Finetune parameters
     parser.add_argument("--ft-unscale-lr", action="store_true")
@@ -330,18 +333,19 @@ def eval_trained_models(args):
     args.data_path = "/home/u17/yuxinr/datasets/"
     args.train = False
     args.eval = True
+    model_path = Path(args.output_dir)
     
-    args.eval_model = args.output_dir / "model.pth"
+    args.eval_model = model_path / "model.pth"
     if os.path.exists(args.eval_model):
         print("evaluating NO FT")
         main(args)
         
-    args.eval_model = args.output_dir / "model_FC.pth"
+    args.eval_model = model_path / "model_FC.pth"
     if os.path.exists(args.eval_model):
         print("evaluating FC FT")
         main(args)
         
-    args.eval_model = args.output_dir / "model_block.pth"
+    args.eval_model = model_path / "model_block.pth"
     if os.path.exists(args.eval_model):
         print("evaluating BLOCK FT")
         main(args)
@@ -363,7 +367,7 @@ if __name__ == '__main__':
     # train
     # args.data_set = "IMNET"
     # args.data_path = "/contrib/datasets/ILSVRC2012/"
-    args.train = True
+    # args.train = True
     # args.gradually_train = True
     # args.rm_shortcut = True
     
