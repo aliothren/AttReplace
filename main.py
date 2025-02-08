@@ -52,6 +52,7 @@ def get_args_parser():
     parser.add_argument("--data-set", default="CIFAR", choices=["CIFAR", "IMNET", "INAT", "INAT19"],
                         type=str, help="Image Net dataset path")
     parser.add_argument("--nb-classes", default=100, type=int, help="number of classes (default:100)")
+    parser.add_argument("--train-subset", default=1.0, type=float, help="Data sample rate")
     
     # data augment parameters
     parser.add_argument('--color-jitter', type=float, default=0.3, metavar='PCT',

@@ -2,8 +2,11 @@
 # All rights reserved.
 import os
 import torch
+import numpy as np
+from torch.utils.data import Subset
 from timm.data import create_transform
 from torchvision import datasets, transforms
+from sklearn.model_selection import StratifiedShuffleSplit
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
@@ -18,6 +21,11 @@ def build_dataset(is_train, args):
         dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
 
+        if is_train and args.train_subset < 1.0:
+            labels = np.array([dataset.targets[i] for i in range(len(dataset))])
+            sss = StratifiedShuffleSplit(n_splits=1, train_size=args.train_subset, random_state=42)
+            indices, _ = next(sss.split(np.zeros(len(labels)), labels))
+            dataset = Subset(dataset, indices)
     return dataset, nb_classes
 
 
