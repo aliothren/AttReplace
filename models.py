@@ -20,12 +20,12 @@ param_dict_mixer = {
 
 
 class ParallelBlock(nn.Module):
-    def __init__(self, teacher_block, student_block, initial_weight_attention=0.9):
+    def __init__(self, teacher_block, student_block):
         super(ParallelBlock, self).__init__()
         self.teacher_block = teacher_block
         self.student_block = student_block
-        self.attn_weight = nn.Parameter(torch.tensor(initial_weight_attention), requires_grad=False)
-        self.mixer_weight = nn.Parameter(torch.tensor(1.0 - initial_weight_attention), requires_grad=False)
+        self.attn_weight = nn.Parameter(torch.tensor(.0), requires_grad=False)
+        self.mixer_weight = nn.Parameter(torch.tensor(1.0), requires_grad=False)
 
     def forward(self, x):
         # Forward pass through both the attention and mixer block
@@ -70,7 +70,7 @@ class MixerBlock(nn.Module):
         y = self.token_mixing(y)
         y = y.transpose(1, 2)
         
-        return y
+        return x+y
 
 
 class AttnBlockNoSC(nn.Module):

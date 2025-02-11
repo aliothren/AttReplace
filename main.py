@@ -25,16 +25,16 @@ from timm.scheduler import create_scheduler
 def get_args_parser():
     parser = argparse.ArgumentParser("DeiT -> MLP Mixer", add_help=False)
     
-    # deit model parameters
+    # DeiT model parameters
     parser.add_argument("--d-model", default="deit_tiny_patch16_224", type=str, metavar="MODEL")
     parser.add_argument("--input-size", default=224, type=int, help="expected images size for model input")
     parser.add_argument("--d-weight", default="", help="path of DeiT model checkpoint")
     
-    # mixer model parameters
+    # Replacing block parameters
     parser.add_argument("--replace", nargs="+", type=int, help="list for index of blocks to be replaced")
     parser.add_argument("--rep-mode", default="mixer", choices=["mixer", "lstm"], 
                         help="Choose to relace whole attention block or only qkv part")
-    parser.add_argument("--qkv-ft-mode", nargs="+", type=str, help="list for qkv finetune strategies")
+    parser.add_argument("--block-ft-mode", nargs="+", type=str, help="list for qkv finetune strategies")
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     parser.add_argument('--train', action='store_true', help='Train replaced Mixer blockes')
@@ -58,8 +58,7 @@ def get_args_parser():
     parser.add_argument('--color-jitter', type=float, default=0.3, metavar='PCT',
                         help='Color jitter factor (default: 0.3)')
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
-                        help='Use AutoAugment policy. "v0" or "original". " + \
-                             "(default: rand-m9-mstd0.5-inc1)')
+                        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)')
     parser.add_argument('--train-interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
     parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
@@ -111,9 +110,6 @@ def get_args_parser():
                         help='qkv finetune learning rate (default: 5e-5)')
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
-    parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
-    parser.add_argument('--warmup-lr', type=float, default=1e-6, help='Warm-up initial learning rate')
-
     
     # Finetune parameters
     parser.add_argument("--ft-unscale-lr", action="store_true")
@@ -237,16 +233,12 @@ def main(args):
         gc.collect()
         torch.cuda.empty_cache()
         
-        for ft_mode in args.qkv_ft_mode:
+        for ft_mode in args.block_ft_mode:
             args.gradually_train = False
             
             qkv_ft_model = models.cut_extra_layers(trained_model, max(args.replace))
-            model_ori = copy.deepcopy(model_deit)
-            partial_model_ori = models.cut_extra_layers(model_ori, max(args.replace))
             models.set_requires_grad(qkv_ft_model, "train", args.replace, ft_mode)
-            models.set_requires_grad(partial_model_ori, "train", [], args.rep_mode)
             qkv_ft_model.to(device)
-            partial_model_ori.to(device)
             
             print(f"Training {ft_mode} of QKV-trained model")
             args.lr = args.qkv_ft_lr
@@ -361,7 +353,7 @@ if __name__ == '__main__':
     
     args.d_model = deit_model
     args.d_weight = deit_weight
-    args.qkv_ft_mode = ["block"]
+    args.block_ft_mode = ["block"]
     args.lr = 5e-4
     args.batch_size = 2048
     
