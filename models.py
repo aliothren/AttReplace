@@ -17,6 +17,17 @@ param_dict_mixer = {
         "token_hid_dim": 3072,
     }
 }
+param_dict_lstm = {
+    "deit_tiny_patch16_224":{
+        "input_dim": 192,
+        "hidden_dim": 128,
+        "output_dim": 192,
+        "num_layers": 1,
+    },
+   
+    "deit_base_patch16_224":{ # to be determined
+    }
+}
 
 
 class ParallelBlock(nn.Module):
@@ -71,6 +82,24 @@ class MixerBlock(nn.Module):
         y = y.transpose(1, 2)
         
         return y
+
+
+class LstmBlock(nn.Module):
+    def __init__(self, model_name, num_layers=1, dropout=0.1):
+        super(LstmBlock, self).__init__()
+        self.param_dict = param_dict_lstm
+        input_dim = self.param_dict[model_name]["input_dim"]
+        output_dim = self.param_dict[model_name]["output_dim"]
+        hidden_dim = self.param_dict[model_name]["hidden_dim"]
+        num_layers = self.param_dict[model_name]["num_layers"]
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, 
+                            num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.proj = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        out = self.proj(lstm_out)
+        return out
 
 
 class AttnBlockNoSC(nn.Module):
@@ -168,9 +197,14 @@ def replace_attention(model, repl_blocks, target = None, remove_sc = False,
         if target == "attn":
             continue
         elif target == "mixer":
-            mlp_block = MixerBlock(model_name)
+            mixer_block = MixerBlock(model_name)
             repl_block = copy.deepcopy(model.blocks[blk_index])
-            repl_block.attn = mlp_block
+            repl_block.attn = mixer_block
+        elif target == "lstm":
+            lstm_block = LstmBlock(model_name)
+            repl_block = copy.deepcopy(model.blocks[blk_index])
+            repl_block.attn = lstm_block
+            # repl_block = lstm_block
         else:
             raise NotImplementedError("Not available replace method")  
 
@@ -211,10 +245,12 @@ def cut_extra_layers(model, max_index):
 
 def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", trainable=True):
     target_names = [f"blocks.{block}" for block in target_blocks]
+    print("Trainable Params:")
     
     if mode == "finetune":
         for name, param in model.named_parameters():
             param.requires_grad = trainable
+            print(name)
     
     if mode == "train":
         # turn the whole block to trainable
@@ -223,13 +259,7 @@ def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", 
                 param.requires_grad = not trainable
                 if any(target in name for target in target_names):
                     param.requires_grad = trainable
-        # turn the replaced MLP-Mixer to trainable
-        elif target_layers == "mixer":
-            for name, param in model.named_parameters():
-                param.requires_grad = not trainable
-                if any(target in name for target in target_names):
-                    if "mlp" not in name:
-                        param.requires_grad = trainable
+                    print(name)
         # turn the FC layers in replaced block to trainable      
         elif target_layers == "FC":
             for name, param in model.named_parameters():
@@ -237,4 +267,13 @@ def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", 
                 if any(target in name for target in target_names):
                     if "mlp" in name:
                         param.requires_grad = trainable
+                        print(name)
+        # turn the replaced MLP-Mixer to trainable
+        elif target_layers == "mixer" or target_layers == "lstm":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    if "attn" in name and "teacher" not in name:
+                        param.requires_grad = trainable
+                        print(name)
 

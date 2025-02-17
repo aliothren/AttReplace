@@ -11,8 +11,7 @@ from typing import Iterable
 from timm.utils import accuracy
 
 
-def generate_weight_schedule(total_epochs=50, pure_student_epochs=20,
-                             scheme="linear", params=None):
+def generate_weight_schedule(total_epochs=50, scheme="linear", params=None):
     """
     Generate a weight schedule for teacher-student learning.
     
@@ -32,9 +31,9 @@ def generate_weight_schedule(total_epochs=50, pure_student_epochs=20,
     if params is None:
         params = {}
     teacher_weights = []
-    student_weights = []
     
-    # Add 20 epochs for pure student learning
+    pure_student_epochs = int(total_epochs * 0.3)
+    # pure_student_epochs = 0
     epochs = total_epochs - pure_student_epochs
     for epoch in range(epochs):
         if scheme == "linear":
@@ -56,7 +55,7 @@ def generate_weight_schedule(total_epochs=50, pure_student_epochs=20,
 
         elif scheme == "inverse":
             # Inverse decay: teacher_weight = 1 / (1 + alpha * epoch)
-            alpha = params.get("alpha", 0.1)
+            alpha = params.get("alpha", 0.2)
             teacher_weight = 1 / (1 + alpha * epoch)
 
         else:
@@ -64,13 +63,16 @@ def generate_weight_schedule(total_epochs=50, pure_student_epochs=20,
 
         # Store weights
         teacher_weights.append(teacher_weight)
-        student_weights.append(1 - teacher_weight)
 
+    if scheme == "exp" or scheme == "inverse":
+        min_weight = min(teacher_weights)
+        max_weight = max(teacher_weights)
+        teacher_weights = [0.98 * (w - min_weight) / (max_weight - min_weight) for w in teacher_weights]
+    
+    student_weights = [1 - w for w in teacher_weights]
     # Extend with pure student learning (teacher_weight = 0)
     teacher_weights.extend([0] * pure_student_epochs)
     student_weights.extend([1] * pure_student_epochs)
-
-    # Return only teacher weights as requested
     return teacher_weights
 
 
@@ -89,7 +91,7 @@ def evaluate(data_loader, model, device):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
-    for images, target in metric_logger.log_every(data_loader, 10, header):
+    for images, target in metric_logger.log_every(data_loader, 100, header):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
@@ -119,7 +121,7 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    print_freq = 100
     
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
@@ -178,13 +180,19 @@ def train_model(args, mode, model, teacher_model,
         checkpoint_path = args.output_dir / "ft_checkpoint.pth"
         print(f"Start finetuning for {args.epochs} epochs")
     
-    teacher_model.eval()
-    if args.train_in_eval:
+    model.train()
+    if mode == "train":
         model.eval()
-        for blk in args.replace:
-            model.blocks[blk].train()
-    else:
-        model.train()    
+        if teacher_model is not None:
+            teacher_model.eval()
+        if args.replace:
+            for blk in args.replace:
+                if hasattr(model.blocks[blk], "attn"):
+                    model.blocks[blk].attn.train()
+                elif hasattr(model.blocks[blk].student_block, "attn"):
+                    model.blocks[blk].student_block.attn.train()
+                else:
+                    print(f"Warning: Block {blk} has no 'attn' layer, skipping...")
         
     start_time = time.time()
     if args.gradually_train:

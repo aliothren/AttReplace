@@ -48,7 +48,7 @@ def get_args_parser():
                         type=str, help="criterion of finetune, only used in global finetune")
     
     # data parameters
-    parser.add_argument("--data-path", default="/home/u17/yuxinr/datasets/", type=str, help="dataset path")
+    parser.add_argument("--data-path", default="/home/yuxinr/datasets/CIFAR/", type=str, help="dataset path")
     parser.add_argument("--data-set", default="CIFAR", choices=["CIFAR", "IMNET", "INAT", "INAT19"],
                         type=str, help="Image Net dataset path")
     parser.add_argument("--nb-classes", default=100, type=int, help="number of classes (default:100)")
@@ -90,13 +90,13 @@ def get_args_parser():
     parser.add_argument('--output-dir', default='', help='path where to save, empty for no saving')
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
-    parser.add_argument('--batch-size', default=512, type=int)
+    parser.add_argument('--batch-size', default=4096, type=int)
     parser.add_argument("--drop", type=float, default=0.0, metavar="PCT",
                         help="Dropout rate (default: 0.)")
     parser.add_argument("--drop-path", type=float, default=0.1, metavar="PCT",
                         help="Drop path rate (default: 0.1)")
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--num_workers', default=6, type=int)
+    parser.add_argument('--num_workers', default=12, type=int)
     parser.add_argument('--pin-mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.set_defaults(pin_mem=True)
@@ -168,7 +168,7 @@ def main(args):
         print(f"Evaluation model: {args.eval_model}")
         model = torch.load(args.eval_model)
         model.to(device)
-        models.set_requires_grad(model, "train", target_blocks=[], target_layers="all")
+        models.set_requires_grad(model, "train", target_blocks=[], target_layers="block")
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         del model, data_loader_val, dataset_val
@@ -202,7 +202,7 @@ def main(args):
         partial_model.to(device)
         partial_model_ori.to(device) 
         
-        base_dir = "/home/u17/yuxinr/block_distill/model/"
+        base_dir = "/home/yuxinr/AttnDistill/models/"
         args.output_dir = get_unique_output_dir(base_dir)
               
         ### EMA augmentation in training not implemented
@@ -222,14 +222,14 @@ def main(args):
             criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
             train_data=data_loader_train, device=device, n_parameters=n_parameters
             )
-        
+        # trained_partial_model = partial_model
         complete_model = copy.deepcopy(model_deit)
         trained_model = models.recomplete_model(
             trained_model=trained_partial_model, origin_model=complete_model, repl_blocks=args.replace, 
             grad_train=args.gradually_train, remove_sc=args.rm_shortcut
             )
         save_path = args.output_dir / "model.pth"
-        trained_model_dict["model"] = trained_model.state_dict()
+        # trained_model_dict["model"] = trained_model.state_dict()
         # torch.save(trained_model_dict, save_path)
         torch.save(trained_model, save_path)
         del optimizer
@@ -330,7 +330,7 @@ def main(args):
 
 def eval_trained_models(args):
     args.data_set = "IMNET"
-    args.data_path = "/home/u17/yuxinr/datasets/"
+    args.data_path = "/srv/datasets/imagenet/"
     args.train = False
     args.eval = True
     model_path = Path(args.output_dir)
@@ -361,12 +361,13 @@ if __name__ == '__main__':
     args.d_model = deit_model
     args.d_weight = deit_weight
     args.qkv_ft_mode = ["block"]
-    args.lr = 5e-4
-    args.batch_size = 2048
+    # args.qkv_ft_mode = []
+    # args.lr = 5e-4
+    # args.batch_size = 2048
     
     # train
     # args.data_set = "IMNET"
-    # args.data_path = "/contrib/datasets/ILSVRC2012/"
+    # args.data_path = "/srv/datasets/imagenet/"
     # args.train = True
     # args.gradually_train = True
     # args.rm_shortcut = True
@@ -375,18 +376,8 @@ if __name__ == '__main__':
     # args.data_set = "IMNET"
     # args.train = False
     # args.eval = True
-    # args.eval_model = "/home/u17/yuxinr/block_distill/model/2024-11-20-16-12/replaced_model_qkvFC_ft.pth"
+    # args.eval_model = ".pth"
     # args.sched = "constant"
-    
-    # finetune
-    # args.data_set = "CIFAR"
-    # args.train = False
-    # args.finetune = True
-    # # args.ft_model = "/home/u17/yuxinr/block_distill/model/2024-11-19-19-11/replaced_model.pth"
-    # args.ft_lr = 5e-5
-    # args.ft_mode = "cosine"
-    # # # args.data_path = "/contrib/datasets/ILSVRC2012/"
-    # args.ft_epochs = 50
         
     main(args)
     eval_trained_models(args)
