@@ -30,23 +30,6 @@ param_dict_lstm = {
 }
 
 
-class ParallelBlock(nn.Module):
-    def __init__(self, teacher_block, student_block, initial_weight_attention=0.9):
-        super(ParallelBlock, self).__init__()
-        self.teacher_block = teacher_block
-        self.student_block = student_block
-        self.attn_weight = nn.Parameter(torch.tensor(initial_weight_attention), requires_grad=False)
-        self.mixer_weight = nn.Parameter(torch.tensor(1.0 - initial_weight_attention), requires_grad=False)
-
-    def forward(self, x):
-        # Forward pass through both the attention and mixer block
-        attn_out = self.teacher_block(x)
-        mixer_out = self.student_block(x)
-        # Weighted sum of both outputs
-        y = self.attn_weight * attn_out + self.mixer_weight * mixer_out
-        return y
-
-
 class MlpBlock(nn.Module):
     def __init__(self, input_dim, mlp_dim, dropout = 0.):
         super(MlpBlock, self).__init__()
@@ -208,25 +191,15 @@ def replace_attention(model, repl_blocks, target = None, remove_sc = False,
         else:
             raise NotImplementedError("Not available replace method")  
 
-        if grad_train:
-            teacher_block = copy.deepcopy(model.blocks[blk_index])
-            repl_block = ParallelBlock(teacher_block, repl_block)
-                
         repl_block.to("cuda")
         model.blocks[blk_index] = repl_block
     
     return model
 
 
-def recomplete_model(trained_model, origin_model, repl_blocks, 
-                     grad_train = False, remove_sc = False):
+def recomplete_model(trained_model, origin_model, repl_blocks, remove_sc = False):
     for blk_index in repl_blocks:
-        if grad_train:
-            origin_model.blocks[blk_index] = trained_model.blocks[blk_index].student_block
-        else:
-            origin_model.blocks[blk_index] = trained_model.blocks[blk_index]
-        
-        # recover removed shortcuts
+        origin_model.blocks[blk_index] = trained_model.blocks[blk_index]
         if remove_sc:
             origin_model.blocks[blk_index] = recover_shortcut(origin_model.blocks[blk_index])
     return origin_model
@@ -243,7 +216,7 @@ def cut_extra_layers(model, max_index):
     return model
 
 
-def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", trainable=True):
+def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "attn", trainable=True):
     target_names = [f"blocks.{block}" for block in target_blocks]
     print("Trainable Params:")
     
@@ -254,14 +227,14 @@ def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", 
     
     if mode == "train":
         # turn the whole block to trainable
-        if target_layers == "block":
+        if target_part == "block":
             for name, param in model.named_parameters():
                 param.requires_grad = not trainable
                 if any(target in name for target in target_names):
                     param.requires_grad = trainable
                     print(name)
         # turn the FC layers in replaced block to trainable      
-        elif target_layers == "FC":
+        elif target_part == "FC":
             for name, param in model.named_parameters():
                 param.requires_grad = not trainable
                 if any(target in name for target in target_names):
@@ -269,7 +242,7 @@ def set_requires_grad(model, mode, target_blocks = [], target_layers = "mixer", 
                         param.requires_grad = trainable
                         print(name)
         # turn the replaced MLP-Mixer to trainable
-        elif target_layers == "mixer" or target_layers == "lstm":
+        elif target_part == "attn":
             for name, param in model.named_parameters():
                 param.requires_grad = not trainable
                 if any(target in name for target in target_names):

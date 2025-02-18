@@ -11,77 +11,6 @@ from typing import Iterable
 from timm.utils import accuracy
 
 
-def generate_weight_schedule(total_epochs=50, scheme="linear", params=None):
-    """
-    Generate a weight schedule for teacher-student learning.
-    
-    Args:
-        total_epochs (int): Total number of training epochs (default is 50).
-        scheme (str): The decay scheme to use ("linear", "step", "exponential", "cosine", "inverse").
-        params (dict): Parameters for the chosen scheme.
-                       Example for each scheme:
-                       - "step": {"steps": [20, 40], "decay": 0.5}
-                       - "exponential": {"lambda": 0.1}
-                       - "cosine": {}
-                       - "inverse": {"alpha": 0.05}
-    
-    Returns:
-        list: A list of teacher weights for each epoch (length: total_epochs + 20).
-    """
-    if params is None:
-        params = {}
-    teacher_weights = []
-    
-    pure_student_epochs = int(total_epochs * 0.3)
-    # pure_student_epochs = 0
-    epochs = total_epochs - pure_student_epochs
-    for epoch in range(epochs):
-        if scheme == "linear":
-            teacher_weight = max(0, 1 - epoch / epochs)
-        
-        elif scheme == "step":
-            interval = params.get("interval", 10)
-            decay_value = params.get("decay_value", 0.2)
-            teacher_weight = max(0, 0.95 - (epoch // interval) * decay_value)
-
-        elif scheme == "exp":
-            # Exponential decay: teacher_weight = exp(-lambda * epoch)
-            lambda_ = params.get("lambda", 0.1)
-            teacher_weight = 1 - np.exp(-lambda_ * (epochs - epoch))
-
-        elif scheme == "cosine":
-            # Cosine decay: teacher_weight = 0.5 * (1 + cos(pi * epoch / total_epochs))
-            teacher_weight = 0.5 * (1 + np.cos(np.pi * epoch / epochs))
-
-        elif scheme == "inverse":
-            # Inverse decay: teacher_weight = 1 / (1 + alpha * epoch)
-            alpha = params.get("alpha", 0.2)
-            teacher_weight = 1 / (1 + alpha * epoch)
-
-        else:
-            raise ValueError(f"Unknown scheme: {scheme}")
-
-        # Store weights
-        teacher_weights.append(teacher_weight)
-
-    if scheme == "exp" or scheme == "inverse":
-        min_weight = min(teacher_weights)
-        max_weight = max(teacher_weights)
-        teacher_weights = [0.98 * (w - min_weight) / (max_weight - min_weight) for w in teacher_weights]
-    
-    student_weights = [1 - w for w in teacher_weights]
-    # Extend with pure student learning (teacher_weight = 0)
-    teacher_weights.extend([0] * pure_student_epochs)
-    student_weights.extend([1] * pure_student_epochs)
-    return teacher_weights
-
-
-def adjust_weights(epoch, parallel_block, weight_schedule):
-    teacher_weight = weight_schedule[epoch]
-    parallel_block.attn_weight.data.fill_(teacher_weight)
-    parallel_block.mixer_weight.data.fill_(1.0 - teacher_weight)
-
-
 @torch.no_grad()
 def evaluate(data_loader, model, device):
     criterion = torch.nn.CrossEntropyLoss()
@@ -132,7 +61,7 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
                 outputs = model.forward_features(samples)
                 teacher_output = teacher_model.forward_features(samples)
                 loss = criterion(outputs, teacher_output)
-            elif mode == "class":
+            elif mode == "classification":
                 outputs = model(samples)
                 loss = criterion(outputs, targets)
             elif mode == "combine":
@@ -168,7 +97,7 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
     
 def train_model(args, mode, model, teacher_model, 
                 criterion, optimizer, loss_scaler, lr_scheduler,
-                train_data, device, n_parameters):
+                train_data, n_parameters):
     
     with (args.output_dir / "log.txt").open("a") as f:
         f.write("Args: " + str(args) + "\n")
@@ -195,18 +124,10 @@ def train_model(args, mode, model, teacher_model,
                     print(f"Warning: Block {blk} has no 'attn' layer, skipping...")
         
     start_time = time.time()
-    if args.gradually_train:
-        weight_schedule = generate_weight_schedule(total_epochs=args.epochs, scheme=args.grad_mode)
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.gradually_train:
-            for blk in args.replace:
-                adjust_weights(epoch, model.blocks[blk], weight_schedule)
-            s_weight = float(model.blocks[args.replace[0]].mixer_weight)
-            t_weight = float(model.blocks[args.replace[0]].attn_weight)
-            print(f"Teacher weight: {t_weight}; student weight: {s_weight}")
+    for epoch in range(0, args.epochs):
         train_stats = train_one_epoch(
             mode, model, teacher_model, criterion, train_data, optimizer,
-            device, epoch, loss_scaler,args.clip_grad)
+            args.device, epoch, loss_scaler,args.clip_grad)
 
         lr_scheduler.step(epoch)
         

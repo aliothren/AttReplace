@@ -2,21 +2,30 @@
 # All rights reserved.
 import os
 import torch
+import numpy as np
+from torch.utils.data import Subset
 from timm.data import create_transform
 from torchvision import datasets, transforms
+from sklearn.model_selection import StratifiedShuffleSplit
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
 
-    if args.data_set == "CIFAR":
+    if args.dataset == "CIFAR":
         dataset = datasets.CIFAR100(args.data_path, train=is_train, transform=transform)
         nb_classes = 100
-    elif args.data_set == "IMNET":
+    elif args.dataset == "IMNET":
         root = os.path.join(args.data_path, "train" if is_train else "val")
         dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
+
+        if is_train and args.train_subset < 1.0:
+            labels = np.array([dataset.targets[i] for i in range(len(dataset))])
+            sss = StratifiedShuffleSplit(n_splits=1, train_size=args.train_subset, random_state=42)
+            indices, _ = next(sss.split(np.zeros(len(labels)), labels))
+            dataset = Subset(dataset, indices)
 
     return dataset, nb_classes
 
@@ -57,7 +66,7 @@ def build_transform(is_train, args):
 
 def load_dataset(args, mode):
     if mode == "train":
-        print(f"Loading training dataset {args.data_set}")
+        print(f"Loading training dataset {args.dataset}")
         dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         data_loader_train = torch.utils.data.DataLoader(
@@ -70,7 +79,7 @@ def load_dataset(args, mode):
         return data_loader_train
     
     elif mode == "val":
-        print(f"Loading validation dataset {args.data_set}")
+        print(f"Loading validation dataset {args.dataset}")
         dataset_val, args.nb_classes = build_dataset(is_train=False, args=args)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         data_loader_val = torch.utils.data.DataLoader(
