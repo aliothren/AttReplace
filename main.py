@@ -73,13 +73,15 @@ def get_args_parser():
     
     # Training setups
     parser.add_argument("--train-mode", default="parallel", choices=["parallel", "sequential"])
+    parser.add_argument("--step", default=3, type=int, help="Step length when sequentially replace blocks and training")
+    parser.add_argument("--interm-model", default="", type=str, help="Path of intermediate model in sequential training")
     parser.add_argument("--replace", type=parse_replace, help="List of indices or range of blocks to replace")
     parser.add_argument("--rep-by", default="lstm", choices=["mixer", "lstm"], 
                         help="Structure used to replace attention")
     parser.add_argument("--block-ft", action='store_true', 
                         help="Block-level finetune the replaced blocks after training attention")
     parser.set_defaults(block_ft=True)
-    parser.add_argument("--train-loss", default="cosine", choices=["cosine", "classification", "combine"],
+    parser.add_argument("--train-loss", default="similarity", choices=["similarity", "classification", "combine"],
                         type=str, help="Criterion using in training")
     parser.add_argument("--rm-shortcut", action="store_true", 
                         help="Remove shortcut connection when training replaced attention")
@@ -125,7 +127,7 @@ def get_args_parser():
     # Finetuning setups
     parser.add_argument("--ft-model", default="", help="Path of model to be finetuned")
     parser.add_argument("--ft-loss", default="classification", 
-                        choices=["cosine", "classification", "combine"],
+                        choices=["similarity", "classification", "combine"],
                         type=str, help="Criterion using in global finetune")
     parser.add_argument("--ft-batch-size", default=256, type=int, help="Batch size when global finetuning")
     parser.add_argument("--ft-epochs", default=30, type=int, help="Training epochs when global finetuning")
@@ -181,14 +183,10 @@ def get_unique_output_dir(base_dir):
     return output_dir
 
 
-def main(args):
+def main(args, seq=0):
     print(args)
     print(f"Using device: {args.device}")
-    
-    ########################################
-    ### distributed training not implemented
-    ########################################
-    
+
     # fix the seed for reproducibility
     seed = args.seed
     # seed = args.seed + utils.get_rank()
@@ -197,13 +195,15 @@ def main(args):
     # random.seed(seed)
     cudnn.benchmark = True
 
+    data_loader_train = load_dataset(args, "train")
+    data_loader_val, dataset_val = load_dataset(args, "val")
+    
     if args.mode == "eval":
-        data_loader_val, dataset_val = load_dataset(args, "val")
         print(f"Evaluation model: {args.eval_model}")
         model = torch.load(args.eval_model)
         model.to(args.device)
         models.set_requires_grad(model, target_blocks=[])
-        test_stats = evaluate(data_loader_val, model, args.device)
+        test_stats = evaluate(data_loader_val, args.device, model)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
         del model, data_loader_val, dataset_val
@@ -211,10 +211,6 @@ def main(args):
         torch.cuda.empty_cache()
         
     elif args.mode == "train":
-        # Load training data
-        data_loader_train = load_dataset(args, "train")
-        #TODO: add back validation loss
-         
         # Load base models
         print(f"Creating DeiT model: {args.d_model}")
         args.nb_classes = 1000 # if using CIFAR train imnet model
@@ -223,53 +219,60 @@ def main(args):
             drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size
             )
         model_deit = models.load_weight(model_deit, args.d_weight)
-        #TODO: process sequential training
-        model_ori = copy.deepcopy(model_deit)
-        model = copy.deepcopy(model_deit)
-        print(f"Replacing blocks: {args.replace}; Replace by: {args.rep_by}")
-        model_ori = models.replace_attention(
-            model=model_ori, repl_blocks=args.replace, target="attn", remove_sc=args.rm_shortcut)
-        model_repl = models.replace_attention(
-            model=model, repl_blocks=args.replace, target=args.rep_by, 
+        model_deit.to(args.device)
+        # Load and modify teacher model
+        teacher_model = copy.deepcopy(model_deit)
+        teacher_model.to(args.device)
+        teacher_model = models.replace_attention(
+            model=teacher_model, repl_blocks=args.replace, target="attn", 
             remove_sc=args.rm_shortcut, model_name=args.d_model
+        )
+        # Load and modify student model
+        if seq == 0:
+            student_model = models.replace_attention(
+                model=model_deit, repl_blocks=args.replace, target=args.rep_by, 
+                remove_sc=args.rm_shortcut, model_name=args.d_model
             )
-
-        partial_model = models.cut_extra_layers(model_repl, max(args.replace))
-        partial_model_ori = models.cut_extra_layers(model_ori, max(args.replace))
-        models.set_requires_grad(partial_model, "train", args.replace, "attn")
-        models.set_requires_grad(partial_model_ori, "train", [], "attn")
-        partial_model.to(args.device)
-        partial_model_ori.to(args.device) 
+        else:
+            student_model = torch.load(args.interm_model)
+            student_model = models.replace_attention(
+                model=student_model, repl_blocks=args.replace, target=args.rep_by, 
+                remove_sc=args.rm_shortcut, model_name=args.d_model
+            )
         
-        args.output_dir = get_unique_output_dir(args.base_dir)
-        n_parameters = sum(p.numel() for p in partial_model.parameters() if p.requires_grad)
+        # Set trainable parameters
+        models.set_requires_grad(teacher_model, "train", [], "attn") # No trainable param in teacher
+        models.set_requires_grad(student_model, "train", args.replace, "attn") # Target attn part trainable
+        n_parameters = sum(p.numel() for p in student_model.parameters() if p.requires_grad)
         print(f"number of trainable params: {n_parameters}")
-
+        
+        # Set unique output directory
+        if seq == 0:
+            args.output_dir = get_unique_output_dir(args.base_dir)
+        
+        # Set training configurations
         if not args.unscale_lr:
             linear_scaled_lr = args.lr * args.batch_size / 512.0
             args.lr = linear_scaled_lr
-        optimizer = create_optimizer(args, partial_model)
+        optimizer = create_optimizer(args, student_model)
         loss_scaler = NativeScaler()
         lr_scheduler, _ = create_scheduler(args, optimizer)
-        criterion = CosineSimilarityLoss()
         
-        trained_partial_model, trained_model_dict = train_model(
-            args=args, mode="train", model=partial_model, teacher_model=partial_model_ori,
-            criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
-            train_data=data_loader_train, n_parameters=n_parameters
+        # Train model
+        trained_model, trained_model_dict = train_model(
+            args=args, stage="attn", loss_mode=args.train_loss,
+            model=student_model, teacher_model=teacher_model,
+            train_data=data_loader_train, test_data=data_loader_val,
+            optimizer=optimizer, loss_scaler=loss_scaler, 
+            lr_scheduler=lr_scheduler, n_parameters=n_parameters
             )
-        complete_model = copy.deepcopy(model_deit)
-        trained_model = models.recomplete_model(
-            trained_model=trained_partial_model, origin_model=complete_model, 
-            repl_blocks=args.replace, remove_sc=args.rm_shortcut
-            )
-        save_path = args.output_dir / "model.pth"
-        # trained_model_dict["model"] = trained_model.state_dict()
-        # torch.save(trained_model_dict, save_path)
+        
+        # Save model
+        save_path = args.output_dir / f"model_seq{seq}.pth"
         torch.save(trained_model, save_path)
-        del optimizer
-        gc.collect()
-        torch.cuda.empty_cache()
+        args.interm_model = save_path
+        #TODO: process sequential training
+        
         
         if args.block_ft:
             qkv_ft_model = models.cut_extra_layers(trained_model, max(args.replace))
@@ -295,10 +298,12 @@ def main(args):
             loss_scaler = NativeScaler()
             lr_scheduler, _ = create_scheduler(args, optimizer)
             fted_partial_model, fted_model_dict = train_model(
-                args=args, mode="train", model=qkv_ft_model, teacher_model=partial_model_ori,
-                criterion=criterion, optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
-                train_data=data_loader_train, n_parameters=n_parameters
-                ) 
+                args=args, stage="block", loss_mode="similarity",
+                model=qkv_ft_model, teacher_model=partial_model_ori,
+                train_data=data_loader_train, test_data=data_loader_val,
+                optimizer=optimizer, loss_scaler=loss_scaler, lr_scheduler=lr_scheduler, 
+                n_parameters=n_parameters
+                )
             
             complete_model = copy.deepcopy(model_deit)
             trained_model = models.recomplete_model(
@@ -330,7 +335,7 @@ def main(args):
                 )
             teacher = models.load_weight(model_deit, args.d_weight)
             teacher.to(args.device)
-            if args.ft_loss == "cosine":
+            if args.ft_loss == "similarity":
                 criterion = CosineSimilarityLoss()
             elif args.ft_loss == "combine":
                 criterion == CombinedLoss()
@@ -399,11 +404,14 @@ if __name__ == '__main__':
     if args.train_mode == "sequential":
         print(f"Sequentially training blocks {args.replace}, {args.step} blocks once...")
         blocks = args.replace
+        seq = 0
         while len(blocks) > 0:
             args.replace = blocks[: args.step]
             blocks = blocks[args.step :]
-            main(args)
+            main(args, seq)
             eval_trained_models(args)
+            seq += 1
+        #TODO: finetune head
     elif args.train_mode == "parallel":  
         main(args)
         eval_trained_models(args)

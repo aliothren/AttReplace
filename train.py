@@ -9,11 +9,18 @@ import numpy as np
 
 from typing import Iterable
 from timm.utils import accuracy
+from loss import CosineSimilarityLoss, CombinedLoss
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device):
-    criterion = torch.nn.CrossEntropyLoss()
+def evaluate(data_loader, device, model, teacher_model = None, loss_type="classification"):
+    autocast_ctx = torch.amp.autocast(device_type="cuda") if device.type == "cuda" else torch.cpu.amp.autocast(device_type="cpu")
+    if loss_type == "classification":
+        criterion = torch.nn.CrossEntropyLoss()
+    elif loss_type == "similarity":
+        criterion = CosineSimilarityLoss()
+    else:
+        raise ValueError("Invalid evaluation loss type (classification/similarity).") 
 
     # switch to evaluation mode
     model.eval()
@@ -25,28 +32,40 @@ def evaluate(data_loader, model, device):
         target = target.to(device, non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast():
-            output = model(images)
-            loss = criterion(output, target)
-
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-        batch_size = images.shape[0]
-        metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        if loss_type == "classification":
+            with autocast_ctx:
+                output = model(images)
+                loss = criterion(output, target)
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            batch_size = images.shape[0]
+            metric_logger.update(test_class_loss=loss.item())
+            metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+            metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        elif loss_type == "similarity":
+            with autocast_ctx:
+                output = model.forward_features(images)
+                teacher_output = teacher_model.forward_features(images)
+                loss = criterion(output, teacher_output)
+            metric_logger.update(test_cosine_loss=loss.item())
+                
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    if loss_type == "classification":
+        print("Classification loss on test set:")
+        print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
+              .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    elif loss_type == "similarity":
+        print("Similarity loss on test set:")
+        print(metric_logger)
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
     
 def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module, 
-                    criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
+                    data_loader: Iterable, optimizer: torch.optim.Optimizer, 
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0):
     
+    autocast_ctx = torch.amp.autocast(device_type="cuda") if device.type == "cuda" else torch.cpu.amp.autocast(device_type="cpu")
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
@@ -56,15 +75,18 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
          
-        with torch.cuda.amp.autocast():
-            if mode == "train" or mode == "cosine":
+        with autocast_ctx:
+            if mode == "similarity":
+                criterion = CosineSimilarityLoss()
                 outputs = model.forward_features(samples)
                 teacher_output = teacher_model.forward_features(samples)
                 loss = criterion(outputs, teacher_output)
             elif mode == "classification":
+                criterion = torch.nn.CrossEntropyLoss()
                 outputs = model(samples)
                 loss = criterion(outputs, targets)
             elif mode == "combine":
+                criterion = CombinedLoss()
                 cos_outputs = model.forward_features(samples)
                 cos_teacher_output = teacher_model.forward_features(samples)
                 cls_outputs = model(samples)
@@ -95,42 +117,39 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
     
-def train_model(args, mode, model, teacher_model, 
-                criterion, optimizer, loss_scaler, lr_scheduler,
-                train_data, n_parameters):
+def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_data,
+                optimizer, loss_scaler, lr_scheduler, n_parameters):
     
     with (args.output_dir / "log.txt").open("a") as f:
         f.write("Args: " + str(args) + "\n")
-        
-    if mode == "train":
-        checkpoint_path = args.output_dir / "checkpoint.pth"
-        print(f"Start training for {args.epochs} epochs")      
-    else:
-        checkpoint_path = args.output_dir / "ft_checkpoint.pth"
-        print(f"Start finetuning for {args.epochs} epochs")
+    checkpoint_path = args.output_dir / f"{stage}_checkpoint.pth"
+    best_checkpoint_path = args.output_dir / f"{stage}_best_checkpoint.pth"
+    print(f"Start {stage} training for {args.epochs} epochs")      
     
-    model.train()
-    if mode == "train":
-        model.eval()
-        if teacher_model is not None:
-            teacher_model.eval()
-        if args.replace:
-            for blk in args.replace:
-                if hasattr(model.blocks[blk], "attn"):
-                    model.blocks[blk].attn.train()
-                elif hasattr(model.blocks[blk].student_block, "attn"):
-                    model.blocks[blk].student_block.attn.train()
-                else:
-                    print(f"Warning: Block {blk} has no 'attn' layer, skipping...")
-        
+    if teacher_model is not None:
+        teacher_model.eval()
+         
     start_time = time.time()
-    for epoch in range(0, args.epochs):
+    max_accuracy = 0.0
+    for epoch in range(args.epochs):
+        # Set only target part in training mode
+        model.eval()
+        for blk in args.replace:
+            if stage == "attn":
+                model.blocks[blk].attn.train()
+            elif stage in ["block", "global"]:
+                model.blocks[blk].train()
+            else:
+                raise ValueError("Invalid training stage (attn/block/global).") 
+             
         train_stats = train_one_epoch(
-            mode, model, teacher_model, criterion, train_data, optimizer,
-            args.device, epoch, loss_scaler,args.clip_grad)
+            mode=loss_mode, model=model, teacher_model=teacher_model, data_loader=train_data, 
+            optimizer=optimizer, device=args.device, epoch=epoch, 
+            loss_scaler=loss_scaler, max_norm=args.clip_grad)
 
         lr_scheduler.step(epoch)
         
+        # Save checkpoint model
         model_dict = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -141,25 +160,33 @@ def train_model(args, mode, model, teacher_model,
             }
         if epoch%10 == 0:
             torch.save(model_dict, checkpoint_path)
+        
+        # Evaluate training
+        test_stats_class = evaluate(test_data, args.device, model, None, "classification") # Classification result on test set
+        if loss_mode in ["similarity", "combine"]:
+            test_stats_cosine = evaluate(test_data, args.device, model, teacher_model, "similarity") # Similarity loss on test set
+
+        # Save best checkpoint
+        if max_accuracy < test_stats_class["acc1"]:
+            max_accuracy = test_stats_class["acc1"]
+            torch.save(model_dict, best_checkpoint_path)
+        print(f'Max accuracy: {max_accuracy:.2f}%')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                    #  **{f'test_{k}': v for k, v in test_stats.items()},
+                     **{f'test_{k}': v for k, v in test_stats_class.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
+        if loss_mode in ["similarity", "combine"]:
+            log_stats.update({f'test_cosine_{k}': v for k, v in test_stats_cosine.items()})
         with (args.output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    
-    if mode == "train":
-        print('Training time {}'.format(total_time_str))
-        with (args.output_dir / "log.txt").open("a") as f:
-            f.write("Training time:" + json.dumps(total_time_str) + "\n")
-    else:
-        print('Finetuning time {}'.format(total_time_str))
-        with (args.output_dir / "log.txt").open("a") as f:
-            f.write("Finetuning time:" + json.dumps(total_time_str) + "\n")
+    print(f"{stage} finished.")
+    print('Training time {}'.format(total_time_str))
+    with (args.output_dir / "log.txt").open("a") as f:
+        f.write("Training time:" + json.dumps(total_time_str) + "\n")
             
     return model, model_dict
 

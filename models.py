@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 param_dict_mixer = {
     "deit_tiny_patch16_224":{
@@ -58,13 +58,10 @@ class MixerBlock(nn.Module):
                                      dropout)
         
     def forward(self, x):
-        # Token mixing
-        y = x
-        y = y.transpose(1, 2)
-        y = self.token_mixing(y)
-        y = y.transpose(1, 2)
-        
-        return y
+        x = x.transpose(1, 2)
+        x = self.token_mixing(x)
+        x = x.transpose(1, 2)
+        return x
 
 
 class LstmBlock(nn.Module):
@@ -117,7 +114,27 @@ class AttnBlockWithSC(nn.Module):
         y = self.norm2(x)
         x = x + self.mlp(y)
         return x      
-      
+
+
+class AttnBlockWithOutput(nn.Module):
+    """DeiT Block with shortcut"""
+    def __init__(self, original_block):
+        super(AttnBlockWithOutput, self).__init__()
+        self.attn = original_block.attn
+        self.mlp = original_block.mlp
+        self.norm1 = original_block.norm1
+        self.norm2 = original_block.norm2
+        self.drop_path = getattr(original_block, "drop_path", nn.Identity()) 
+        self.block_output = None
+
+    def forward(self, x):
+        y = self.norm1(x)
+        x = x + self.drop_path(self.attn(y))
+        y = self.norm2(x)
+        x = x + self.drop_path(self.mlp(y))
+        self.block_output = x.clone().detach()
+        return x    
+          
 
 def load_weight(model, weight):
     if weight.startswith("https"):
@@ -171,48 +188,30 @@ def recover_shortcut(block):
 
     
 def replace_attention(model, repl_blocks, target = None, remove_sc = False,
-                      model_name = "", grad_train = False):
+                      model_name = ""):
+    print(f"Replacing blocks: {repl_blocks}; Replace by: {target}")
+    
     for blk_index in repl_blocks:
-        
         if remove_sc:
             model.blocks[blk_index] = remove_shortcut(model.blocks[blk_index])
         
+        block = model.blocks[blk_index]
         if target == "attn":
-            continue
+            repl_block = AttnBlockWithOutput(block)
         elif target == "mixer":
+            repl_block = AttnBlockWithOutput(block)
             mixer_block = MixerBlock(model_name)
-            repl_block = copy.deepcopy(model.blocks[blk_index])
             repl_block.attn = mixer_block
         elif target == "lstm":
+            repl_block = AttnBlockWithOutput(block)
             lstm_block = LstmBlock(model_name)
-            repl_block = copy.deepcopy(model.blocks[blk_index])
             repl_block.attn = lstm_block
-            # repl_block = lstm_block
         else:
-            raise NotImplementedError("Not available replace method")  
+            raise NotImplementedError("Not available replace architecture (attn/mixer/lstm)")  
 
-        repl_block.to("cuda")
+        repl_block.to(DEVICE)
         model.blocks[blk_index] = repl_block
     
-    return model
-
-
-def recomplete_model(trained_model, origin_model, repl_blocks, remove_sc = False):
-    for blk_index in repl_blocks:
-        origin_model.blocks[blk_index] = trained_model.blocks[blk_index]
-        if remove_sc:
-            origin_model.blocks[blk_index] = recover_shortcut(origin_model.blocks[blk_index])
-    return origin_model
-
-
-def cut_extra_layers(model, max_index):
-    del model.blocks[max_index + 1 :]
-    try:
-        del model.fc_norm
-        del model.head_drop
-        del model.head
-    except:
-        print("Model head not deleted")
     return model
 
 
