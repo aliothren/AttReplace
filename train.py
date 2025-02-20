@@ -5,7 +5,6 @@ import json
 import torch
 import utils
 import datetime
-import numpy as np
 
 from typing import Iterable
 from timm.utils import accuracy
@@ -13,7 +12,7 @@ from loss import CosineSimilarityLoss, CombinedLoss
 
 
 @torch.no_grad()
-def evaluate(data_loader, device, model, teacher_model = None, loss_type="classification"):
+def evaluate_model(data_loader, device, model, teacher_model = None, loss_type="classification"):
     autocast_ctx = torch.amp.autocast(device_type="cuda") if device.type == "cuda" else torch.cpu.amp.autocast(device_type="cpu")
     if loss_type == "classification":
         criterion = torch.nn.CrossEntropyLoss()
@@ -53,7 +52,7 @@ def evaluate(data_loader, device, model, teacher_model = None, loss_type="classi
     if loss_type == "classification":
         print("Classification loss on test set:")
         print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-              .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+              .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.test_class_loss))
     elif loss_type == "similarity":
         print("Similarity loss on test set:")
         print(metric_logger)
@@ -62,10 +61,9 @@ def evaluate(data_loader, device, model, teacher_model = None, loss_type="classi
 
     
 def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module, 
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer, 
+                    max_repl: int, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0):
-    
-    autocast_ctx = torch.amp.autocast(device_type="cuda") if device.type == "cuda" else torch.cpu.amp.autocast(device_type="cpu")
+    autocast_ctx = torch.autocast(device_type=device.type)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
@@ -78,19 +76,24 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
         with autocast_ctx:
             if mode == "similarity":
                 criterion = CosineSimilarityLoss()
-                outputs = model.forward_features(samples)
-                teacher_output = teacher_model.forward_features(samples)
-                loss = criterion(outputs, teacher_output)
+                output_student = model(samples)
+                output_teacher = teacher_model(samples)
+                output_block_s = model.blocks[max_repl].block_output
+                output_block_t = teacher_model.blocks[max_repl].block_output
+                loss = criterion(output_block_s, output_block_t)
+                
             elif mode == "classification":
                 criterion = torch.nn.CrossEntropyLoss()
-                outputs = model(samples)
-                loss = criterion(outputs, targets)
+                output = model(samples)
+                loss = criterion(output, targets)
+                
             elif mode == "combine":
                 criterion = CombinedLoss()
-                cos_outputs = model.forward_features(samples)
-                cos_teacher_output = teacher_model.forward_features(samples)
-                cls_outputs = model(samples)
-                loss = criterion(cos_outputs, cos_teacher_output, cls_outputs, targets)
+                output_student = model(samples)
+                output_teacher = teacher_model(samples)
+                output_block_s = model.blocks[max_repl].block_output
+                output_block_t = teacher_model.blocks[max_repl].block_output
+                loss = criterion(output_block_s, output_block_t, output_student, targets)
                 
         loss_value = loss.item()
 
@@ -143,7 +146,8 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
                 raise ValueError("Invalid training stage (attn/block/global).") 
              
         train_stats = train_one_epoch(
-            mode=loss_mode, model=model, teacher_model=teacher_model, data_loader=train_data, 
+            mode=loss_mode, model=model, teacher_model=teacher_model, 
+            max_repl=max(args.replace), data_loader=train_data, 
             optimizer=optimizer, device=args.device, epoch=epoch, 
             loss_scaler=loss_scaler, max_norm=args.clip_grad)
 
@@ -162,9 +166,9 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
             torch.save(model_dict, checkpoint_path)
         
         # Evaluate training
-        test_stats_class = evaluate(test_data, args.device, model, None, "classification") # Classification result on test set
+        test_stats_class = evaluate_model(test_data, args.device, model, None, "classification") # Classification result on test set
         if loss_mode in ["similarity", "combine"]:
-            test_stats_cosine = evaluate(test_data, args.device, model, teacher_model, "similarity") # Similarity loss on test set
+            test_stats_cosine = evaluate_model(test_data, args.device, model, teacher_model, "similarity") # Similarity loss on test set
 
         # Save best checkpoint
         if max_accuracy < test_stats_class["acc1"]:

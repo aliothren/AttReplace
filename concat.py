@@ -11,7 +11,7 @@ import numpy as np
 import torch.backends.cudnn as cudnn
 
 from datasets import load_dataset
-from train import train_model, evaluate
+from train import train_model, evaluate_model
 from loss import CosineSimilarityLoss, CombinedLoss
 
 from pathlib import Path
@@ -244,7 +244,7 @@ if __name__ == '__main__':
     # Test without finetune
     print(f"Evaluating model concated by: {blocks}")
     models.set_requires_grad(replaced_model, "train", target_blocks=[], target_layers="block")
-    test_stats = evaluate(data_loader_val, replaced_model, DEVICE)
+    test_stats = evaluate_model(data_loader_val, replaced_model, DEVICE)
     print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
    
    
@@ -288,7 +288,7 @@ if __name__ == '__main__':
     finetuned_model = torch.load(save_path)
     finetuned_model.to(DEVICE)
     models.set_requires_grad(finetuned_model, "train", target_blocks=[], target_layers="block")
-    test_stats = evaluate(data_loader_val, finetuned_model, DEVICE)
+    test_stats = evaluate_model(data_loader_val, finetuned_model, DEVICE)
     print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
     
 
@@ -301,7 +301,7 @@ if __name__ == '__main__':
     finetuned_model = torch.load(save_path)
     finetuned_model.to(DEVICE)
     models.set_requires_grad(finetuned_model, "train", target_blocks=[], target_layers="block")
-    test_stats = evaluate(data_loader_val, finetuned_model, DEVICE)
+    test_stats = evaluate_model(data_loader_val, finetuned_model, DEVICE)
     print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
     exit(0)
        
@@ -313,7 +313,7 @@ if __name__ == '__main__':
     finetuned_model = torch.load(save_path)
     finetuned_model.to(DEVICE)
     models.set_requires_grad(finetuned_model, "train", target_blocks=[], target_layers="block")
-    test_stats = evaluate(data_loader_val, finetuned_model, DEVICE)
+    test_stats = evaluate_model(data_loader_val, finetuned_model, DEVICE)
     print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
     
     
@@ -365,6 +365,6 @@ if __name__ == '__main__':
     finetuned_model = torch.load(save_path)
     finetuned_model.to(DEVICE)
     models.set_requires_grad(finetuned_model, "train", target_blocks=[], target_layers="block")
-    test_stats = evaluate(data_loader_val, finetuned_model, DEVICE)
+    test_stats = evaluate_model(data_loader_val, finetuned_model, DEVICE)
     print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
     

@@ -1,11 +1,8 @@
-import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 param_dict_mixer = {
     "deit_tiny_patch16_224":{
         "num_patches": 197,
@@ -82,40 +79,6 @@ class LstmBlock(nn.Module):
         return out
 
 
-class AttnBlockNoSC(nn.Module):
-    """DeiT Block without shortcut"""
-    def __init__(self, original_block):
-        super(AttnBlockNoSC, self).__init__()
-        self.attn = original_block.attn
-        self.mlp = original_block.mlp
-        self.norm1 = original_block.norm1
-        self.norm2 = original_block.norm2
-
-    def forward(self, x):
-        x = self.norm1(x)
-        x = self.attn(x)
-        # x = self.norm2(x)
-        # x = self.mlp(x)
-        return x
-
-
-class AttnBlockWithSC(nn.Module):
-    """DeiT Block with shortcut"""
-    def __init__(self, original_block):
-        super(AttnBlockWithSC, self).__init__()
-        self.attn = original_block.attn
-        self.mlp = original_block.mlp
-        self.norm1 = original_block.norm1
-        self.norm2 = original_block.norm2
-
-    def forward(self, x):
-        y = self.norm1(x)
-        x = x + self.attn(y)
-        y = self.norm2(x)
-        x = x + self.mlp(y)
-        return x      
-
-
 class AttnBlockWithOutput(nn.Module):
     """DeiT Block with shortcut"""
     def __init__(self, original_block):
@@ -132,9 +95,9 @@ class AttnBlockWithOutput(nn.Module):
         x = x + self.drop_path(self.attn(y))
         y = self.norm2(x)
         x = x + self.drop_path(self.mlp(y))
-        self.block_output = x.clone().detach()
-        return x    
-          
+        self.block_output = x.clone()
+        return x
+       
 
 def load_weight(model, weight):
     if weight.startswith("https"):
@@ -174,27 +137,11 @@ def load_weight(model, weight):
     # print("Unexpected keys:", unexpected_keys)
     return model
 
-
-# Remove shortcut to avoid gradiant vanish in training
-def remove_shortcut(block):
-    block = AttnBlockNoSC(block)
-    return block
     
-
-# Add shortcut to recover network structure for inference
-def recover_shortcut(block):
-    block = AttnBlockWithSC(block)
-    return  block
-
-    
-def replace_attention(model, repl_blocks, target = None, remove_sc = False,
-                      model_name = ""):
+def replace_attention(model, repl_blocks, target = None, model_name = ""):
     print(f"Replacing blocks: {repl_blocks}; Replace by: {target}")
     
     for blk_index in repl_blocks:
-        if remove_sc:
-            model.blocks[blk_index] = remove_shortcut(model.blocks[blk_index])
-        
         block = model.blocks[blk_index]
         if target == "attn":
             repl_block = AttnBlockWithOutput(block)
@@ -211,7 +158,6 @@ def replace_attention(model, repl_blocks, target = None, remove_sc = False,
 
         repl_block.to(DEVICE)
         model.blocks[blk_index] = repl_block
-    
     return model
 
 
@@ -220,9 +166,20 @@ def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "
     print("Trainable Params:")
     
     if mode == "finetune":
-        for name, param in model.named_parameters():
-            param.requires_grad = trainable
-            print(name)
+        # turn the classification head to trainable
+        if target_part == "head":
+            for param in model.parameters():
+                param.requires_grad = False
+            for name, param in model.head.named_parameters():
+                param.requires_grad = True
+                print(name)
+        # turn the whole blocks to trainable
+        elif target_part == "sequential":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    param.requires_grad = trainable
+                    print(name)
     
     if mode == "train":
         # turn the whole block to trainable
@@ -248,4 +205,3 @@ def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "
                     if "attn" in name and "teacher" not in name:
                         param.requires_grad = trainable
                         print(name)
-
