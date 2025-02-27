@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 import torch.backends.cudnn as cudnn
 
-from datasets import load_dataset
+from data import load_dataset
 from train import train_model, evaluate_model
 
 from pathlib import Path
@@ -119,11 +119,15 @@ def get_args_parser():
                         help='Warm-up initial learning rate when block-level finetuning')
     parser.add_argument('--block-ft-sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler when block-level finetuning (default: "cosine")')
+    parser.add_argument("--finetune-head", action='store_true', 
+                        help="Only use for sequential train/finetune: finetune classification head after sequential train")
+    parser.set_defaults(finetune_head=True)
     
     # Evaluation setups
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
     
     # Finetuning setups
+    parser.add_argument("--ft-mode", default="head", choices=["head", "sequential"])
     parser.add_argument("--ft-model", default="", help="Path of model to be finetuned")
     parser.add_argument("--ft-loss", default="classification", 
                         choices=["similarity", "classification", "combine"],
@@ -186,7 +190,7 @@ def concat_model(base_model, name_list, idx_list):
     for idx in range(len(idx_list)):
         name = name_list[idx]
         # Notice that this name only works for parallel trained models
-        model_path = Path(BASE_DIR) / "models" / name / "model_block_seq0.pth"
+        model_path = Path(BASE_DIR) / "models" / name / "model_block.pth"
         model = torch.load(model_path)
         block = model.blocks[idx_list[idx]]
         block.to(DEVICE)
@@ -411,16 +415,23 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
     if seq == 0 and args.output_dir == '':
         args.output_dir = get_unique_output_dir(args.base_dir)
     
-    # Set training configurations
-    if not args.unscale_lr:
+    # Set block-level parameters as training params
+    args.batch_size = args.ft_batch_size
+    args.epochs = args.ft_epochs
+    args.lr = args.ft_lr
+    if not args.ft_unscale_lr:
         linear_scaled_lr = args.lr * args.batch_size / 512.0
         args.lr = linear_scaled_lr
+    args.warmup_epochs = args.ft_warmup_epochs
+    args.warmup_lr = args.ft_warmup_lr
+    args.sched = args.ft_sched
+    # Set training configurations
     optimizer = create_optimizer(args, model)
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
     
     fted_model, fted_model_dict = train_model(
-        args=args, stage="finetune", loss_mode=args.ft_loss,
+        args=args, stage="global", loss_mode=args.ft_loss,
         model=model, teacher_model=teacher_model,
         train_data=data_loader_train, test_data=data_loader_val,
         optimizer=optimizer, loss_scaler=loss_scaler, 
@@ -492,13 +503,15 @@ if __name__ == '__main__':
         # Name_list and block_list should correspond exactly
         block_list = [ # each item indicates blocks to be finetuned in one step
             [0, 1, 2],
-            [3, ...],
-            ...,
+            [3, 4, 5],
+            [6, 7, 8],
+            [9, 10, 11],
         ]
         name_list = [ # the name of corresponding block
-            ["name0", "name1", "name2"],
-            ["name3", ...],
-            ...,
+            ["2025-02-13-20-36-16", "2025-02-13-20-36-45", "2025-02-13-20-37-18"],
+            ["2025-02-13-20-58-53", "2025-02-13-23-03-53", "2025-02-13-23-04-53"],
+            ["2025-02-13-23-05-54", "2025-02-13-23-07-24", "2025-02-13-23-08-52"],
+            ["2025-02-13-23-09-23", "2025-02-13-23-09-54", "2025-02-13-23-29-29"],
         ]
         # Sequentially finetune target blocks
         if args.ft_mode == "sequential":

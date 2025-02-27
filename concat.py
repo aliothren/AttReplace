@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 import torch.backends.cudnn as cudnn
 
-from datasets import load_dataset
+from AttReplace.data import load_dataset
 from train import train_model, evaluate_model
 from loss import CosineSimilarityLoss, CombinedLoss
 

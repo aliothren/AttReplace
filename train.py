@@ -61,7 +61,7 @@ def evaluate_model(data_loader, device, model, teacher_model = None, loss_type="
 
     
 def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module, 
-                    max_repl: int, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
+                    replace: list, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0):
     autocast_ctx = torch.autocast(device_type=device.type)
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -78,9 +78,11 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
                 criterion = CosineSimilarityLoss()
                 output_student = model(samples)
                 output_teacher = teacher_model(samples)
-                output_block_s = model.blocks[max_repl].block_output
-                output_block_t = teacher_model.blocks[max_repl].block_output
-                loss = criterion(output_block_s, output_block_t)
+                loss = 0
+                for blk in replace:
+                    output_block_s = model.blocks[blk].block_output
+                    output_block_t = teacher_model.blocks[blk].block_output
+                    loss += criterion(output_block_s, output_block_t)
                 
             elif mode == "classification":
                 criterion = torch.nn.CrossEntropyLoss()
@@ -88,12 +90,15 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
                 loss = criterion(output, targets)
                 
             elif mode == "combine":
-                criterion = CombinedLoss()
+                ce_criterion = torch.nn.CrossEntropyLoss()
+                cos_criterion = CosineSimilarityLoss()
                 output_student = model(samples)
                 output_teacher = teacher_model(samples)
-                output_block_s = model.blocks[max_repl].block_output
-                output_block_t = teacher_model.blocks[max_repl].block_output
-                loss = criterion(output_block_s, output_block_t, output_student, targets)
+                loss = ce_criterion(output_student, targets)
+                for blk in replace:
+                    output_block_s = model.blocks[blk].block_output
+                    output_block_t = teacher_model.blocks[blk].block_output
+                    loss += cos_criterion(output_block_s, output_block_t)
                 
         loss_value = loss.item()
 
@@ -144,10 +149,10 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
                 model.blocks[blk].train()
             else:
                 raise ValueError("Invalid training stage (attn/block/global).") 
-             
+            
         train_stats = train_one_epoch(
             mode=loss_mode, model=model, teacher_model=teacher_model, 
-            max_repl=max(args.replace), data_loader=train_data, 
+            replace=args.replace, data_loader=train_data, 
             optimizer=optimizer, device=args.device, epoch=epoch, 
             loss_scaler=loss_scaler, max_norm=args.clip_grad)
 

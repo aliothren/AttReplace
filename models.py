@@ -162,7 +162,7 @@ def replace_attention(model, repl_blocks, target = None, model_name = ""):
 
 
 def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "attn", trainable=True):
-    target_names = [f"blocks.{block}" for block in target_blocks]
+    target_names = [f"blocks.{block}." for block in target_blocks]
     print("Trainable Params:")
     
     if mode == "finetune":
