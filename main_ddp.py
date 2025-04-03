@@ -2,6 +2,8 @@ import gc
 import copy
 import torch
 import fcntl
+import utils
+import random
 import models
 import datetime
 import argparse
@@ -185,12 +187,21 @@ def get_args_parser():
     parser.add_argument('--train-interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
     parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
+    parser.add_argument("--repeated-aug", action="store_true", help="used in distributed training")
+    parser.add_argument("--no-repeated-aug", action="store_false", dest="repeated_aug")
+    parser.set_defaults(repeated_aug=True)
     
     # Random Erase params
     parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT', help='Random erase prob (default: 0.25)')
     parser.add_argument('--remode', type=str, default='pixel', help='Random erase mode (default: "pixel")')
     parser.add_argument('--recount', type=int, default=1, help='Random erase count (default: 1)')
 
+    # distributed training parameters
+    parser.add_argument('--distributed', action='store_true', default=False, help='Enabling distributed training')
+    parser.add_argument('--world_size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    
     return parser
     
 
@@ -235,7 +246,7 @@ def evaluate(args):
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
@@ -262,7 +273,7 @@ def train(args, seq=0):
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
@@ -303,6 +314,12 @@ def train(args, seq=0):
             model=student_model, repl_blocks=args.replace, target=args.rep_by, 
             model_name=args.base_model
         )
+        
+    student_model_without_ddp = student_model
+    if args.distributed:
+        student_model = torch.nn.parallel.DistributedDataParallel(
+            student_model, device_ids=[args.gpu], find_unused_parameters=True)
+        student_model_without_ddp = student_model.module
     
     # Set trainable parameters
     models.set_requires_grad(teacher_model, "train", [], "attn") # No trainable param in teacher
@@ -318,7 +335,7 @@ def train(args, seq=0):
     if not args.unscale_lr:
         linear_scaled_lr = args.lr * args.batch_size / 512.0
         args.lr = linear_scaled_lr
-    optimizer = create_optimizer(args, student_model)
+    optimizer = create_optimizer(args, student_model_without_ddp)
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
     
@@ -332,9 +349,13 @@ def train(args, seq=0):
         )
     
     # Save model
-    save_path = args.output_dir / f"model_seq{seq}.pth"
-    torch.save(trained_model, save_path)
-    args.interm_model = save_path
+    if utils.get_rank() == 0:
+        save_path = args.output_dir / f"model_seq{seq}.pth"
+        if hasattr(trained_model, 'module'):
+            torch.save(trained_model.module, save_path)
+        else:
+            torch.save(trained_model, save_path)
+        args.interm_model = save_path
     
     if args.block_ft:
         print(f"Doing block-level finetuning of attention-trained model...")
@@ -359,8 +380,12 @@ def train(args, seq=0):
         args.warmup_epochs = args.block_ft_warmup_epochs
         args.warmup_lr = args.block_ft_warmup_lr
         args.sched = args.block_ft_sched
+        
         # Set training configurations
-        optimizer = create_optimizer(args, trained_model)
+        trained_model_without_ddp = trained_model
+        if args.distributed:
+            trained_model_without_ddp = trained_model.module
+        optimizer = create_optimizer(args, trained_model_without_ddp)
         loss_scaler = NativeScaler()
         lr_scheduler, _ = create_scheduler(args, optimizer)
         
@@ -374,9 +399,13 @@ def train(args, seq=0):
             )
         
         # Save finetuned model
-        save_path = args.output_dir / f"model_block_seq{seq}.pth"
-        torch.save(fted_model, save_path)
-        args.interm_model = save_path
+        if utils.get_rank() == 0:
+            save_path = args.output_dir / f"model_block_seq{seq}.pth"
+            if hasattr(fted_model, 'module'):
+                torch.save(fted_model.module, save_path)
+            else:
+                torch.save(fted_model, save_path)
+            args.interm_model = save_path
         
         del optimizer, fted_model, teacher_model, data_loader_train, data_loader_val
         gc.collect()
@@ -390,8 +419,7 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
-    # seed = args.seed + utils.get_rank()
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
@@ -452,6 +480,13 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
         
     else:
         raise ValueError("Invalid ft_mode (sequential/head).") 
+            
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True
+            )
+        model_without_ddp = model.module
     
     models.set_requires_grad(model, "finetune", args.replace, ft_mode) # head trainable
     if teacher_model != None:
@@ -474,7 +509,7 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
     args.warmup_lr = args.ft_warmup_lr
     args.sched = args.ft_sched
     # Set training configurations
-    optimizer = create_optimizer(args, model)
+    optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
     
@@ -490,8 +525,12 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
         save_path = args.output_dir / f"model_ft_head.pth"
     else:
         save_path = args.output_dir / f"model_ft_seq{seq}.pth"
-    torch.save(fted_model, save_path)
-    args.interm_model = save_path
+    if utils.get_rank() == 0:
+        if hasattr(fted_model, 'module'):
+            torch.save(fted_model.module, save_path)
+        else:
+            torch.save(fted_model, save_path)
+        args.interm_model = save_path
 
 
 def downstream(args, pretrained_path):
@@ -500,8 +539,7 @@ def downstream(args, pretrained_path):
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
-    # seed = args.seed + utils.get_rank()
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
@@ -515,13 +553,21 @@ def downstream(args, pretrained_path):
     model = models.load_downstream_model(pretrained_path, args)
     model.to(args.device)
     models.set_requires_grad(model, "downstream") # whole model trainable
+    
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True
+            )
+        model_without_ddp = model.module
+        
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"number of trainable params: {n_parameters}")
         
     args.output_dir = get_unique_output_dir(args.base_dir)
     
     # Set training configurations
-    optimizer = create_optimizer(args, model)
+    optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
     fted_model, fted_model_dict = train_model(
@@ -532,8 +578,12 @@ def downstream(args, pretrained_path):
         lr_scheduler=lr_scheduler, n_parameters=n_parameters
         )
     
-    save_path = args.output_dir / "model_ds.pth"
-    torch.save(fted_model, save_path)
+    if utils.get_rank() == 0:
+        save_path = args.output_dir / "model_ds.pth"
+        if hasattr(fted_model, 'module'):
+            torch.save(fted_model.module, save_path)
+        else:
+            torch.save(fted_model, save_path)
     
 
 def eval_trained_models(args, seq=0):
@@ -553,6 +603,7 @@ def eval_trained_models(args, seq=0):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("DeiT -> MLP Mixer", parents=[get_args_parser()])
     args = parser.parse_args()
+    utils.init_distributed_mode(args)
     
     if args.data_path is None:
         args.data_path = DATA_PATH[args.dataset]

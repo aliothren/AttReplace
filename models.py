@@ -1,28 +1,41 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.models import create_model
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 param_dict_mixer = {
-    "deit_tiny_patch16_224":{
+    "DeiT-Tiny":{
         "num_patches": 197,
         "token_hid_dim": 384,
     },
-   
-    "deit_base_patch16_224":{ # to be determined
+    "DeiT-Small":{
+        "num_patches": 197,
+        "token_hid_dim": 384,
+    },
+    "DeiT-Base":{ # to be determined
         "num_patches": 197,
         "token_hid_dim": 3072,
     }
 }
 param_dict_lstm = {
-    "deit_tiny_patch16_224":{
+    "DeiT-Tiny":{
         "input_dim": 192,
-        "hidden_dim": 128,
+        "hidden_dim": 64,
         "output_dim": 192,
+        "num_layers": 2,
+    },
+    "DeiT-Small":{
+        "input_dim": 384,
+        "hidden_dim": 256,
+        "output_dim": 384,
         "num_layers": 1,
     },
-   
-    "deit_base_patch16_224":{ # to be determined
+    "DeiT-Base":{
+        "input_dim": 768,
+        "hidden_dim": 512,
+        "output_dim": 768,
+        "num_layers": 1,
     }
 }
 
@@ -69,9 +82,9 @@ class LstmBlock(nn.Module):
         output_dim = self.param_dict[model_name]["output_dim"]
         hidden_dim = self.param_dict[model_name]["hidden_dim"]
         num_layers = self.param_dict[model_name]["num_layers"]
-        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, 
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, bidirectional=True,
                             num_layers=num_layers, batch_first=True, dropout=dropout)
-        self.proj = nn.Linear(hidden_dim, output_dim)
+        self.proj = nn.Linear(2*hidden_dim, output_dim)
         
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
@@ -164,8 +177,12 @@ def replace_attention(model, repl_blocks, target = None, model_name = ""):
 def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "attn", trainable=True):
     target_names = [f"blocks.{block}." for block in target_blocks]
     print("Trainable Params:")
+    # Global fintune when transfer to downstream datasets
+    if mode == "downstream":
+        for name, param in model.named_parameters():
+            param.requires_grad = trainable
     
-    if mode == "finetune":
+    elif mode == "finetune":
         # turn the classification head to trainable
         if target_part == "head":
             for param in model.parameters():
@@ -181,7 +198,7 @@ def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "
                     param.requires_grad = trainable
                     print(name)
     
-    if mode == "train":
+    elif mode == "train":
         # turn the whole block to trainable
         if target_part == "block":
             for name, param in model.named_parameters():
@@ -205,3 +222,26 @@ def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "
                     if "attn" in name and "teacher" not in name:
                         param.requires_grad = trainable
                         print(name)
+                        
+    else:
+        raise NotImplementedError("Not available set_requires_grad mode (train/finetune/downstream)")  
+                       
+
+def load_downstream_model(model_path, args, source="local", model_name=""):
+    if source == "local":
+        model = torch.load(model_path)
+    elif source == "online":
+        model = create_model(
+            model_name=model_name, pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop,
+            drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size
+            )
+    
+    if hasattr(model, "module"):
+        model = model.module
+        
+    embed_dim = model.head.in_features
+    out_dim = args.nb_classes
+    model.head = nn.Linear(embed_dim, out_dim)
+    nn.init.trunc_normal_(model.head.weight, std=0.02) 
+    nn.init.zeros_(model.head.bias)
+    return model

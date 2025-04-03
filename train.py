@@ -13,6 +13,8 @@ from loss import CosineSimilarityLoss, CombinedLoss
 
 @torch.no_grad()
 def evaluate_model(data_loader, device, model, teacher_model = None, loss_type="classification"):
+    actual_model = model.module if hasattr(model, "module") else model
+    actual_teacher = teacher_model.module if (teacher_model is not None and hasattr(teacher_model, "module")) else teacher_model
     autocast_ctx = torch.amp.autocast(device_type="cuda") if device.type == "cuda" else torch.cpu.amp.autocast(device_type="cpu")
     if loss_type == "classification":
         criterion = torch.nn.CrossEntropyLoss()
@@ -42,8 +44,8 @@ def evaluate_model(data_loader, device, model, teacher_model = None, loss_type="
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
         elif loss_type == "similarity":
             with autocast_ctx:
-                output = model.forward_features(images)
-                teacher_output = teacher_model.forward_features(images)
+                output = actual_model.forward_features(images)
+                teacher_output = actual_teacher.forward_features(images)
                 loss = criterion(output, teacher_output)
             metric_logger.update(test_cosine_loss=loss.item())
                 
@@ -63,6 +65,8 @@ def evaluate_model(data_loader, device, model, teacher_model = None, loss_type="
 def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module, 
                     replace: list, data_loader: Iterable, optimizer: torch.optim.Optimizer, 
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0):
+    actual_model = model.module if hasattr(model, "module") else model
+    actual_teacher = teacher_model.module if (teacher_model is not None and hasattr(teacher_model, "module")) else teacher_model
     autocast_ctx = torch.autocast(device_type=device.type)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -80,8 +84,8 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
                 output_teacher = teacher_model(samples)
                 loss = 0
                 for blk in replace:
-                    output_block_s = model.blocks[blk].block_output
-                    output_block_t = teacher_model.blocks[blk].block_output
+                    output_block_s = actual_model.blocks[blk].block_output
+                    output_block_t = actual_teacher.blocks[blk].block_output
                     loss += criterion(output_block_s, output_block_t)
                 
             elif mode == "classification":
@@ -96,8 +100,8 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
                 output_teacher = teacher_model(samples)
                 loss = ce_criterion(output_student, targets)
                 for blk in replace:
-                    output_block_s = model.blocks[blk].block_output
-                    output_block_t = teacher_model.blocks[blk].block_output
+                    output_block_s = actual_model.blocks[blk].block_output
+                    output_block_t = actual_teacher.blocks[blk].block_output
                     loss += cos_criterion(output_block_s, output_block_t)
                 
         loss_value = loss.item()
@@ -128,11 +132,15 @@ def train_one_epoch(mode, model: torch.nn.Module, teacher_model: torch.nn.Module
 def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_data,
                 optimizer, loss_scaler, lr_scheduler, n_parameters):
     
-    with (args.output_dir / "log.txt").open("a") as f:
-        f.write("Args: " + str(args) + "\n")
+    actual_model = model.module if hasattr(model, "module") else model
+    
+    if utils.get_rank() == 0:
+        with (args.output_dir / "log.txt").open("a") as f:
+            f.write("Args: " + str(args) + "\n")
     checkpoint_path = args.output_dir / f"{stage}_checkpoint.pth"
     best_checkpoint_path = args.output_dir / f"{stage}_best_checkpoint.pth"
-    print(f"Start {stage} training for {args.epochs} epochs")      
+    if utils.get_rank() == 0:
+        print(f"Start {stage} training for {args.epochs} epochs")      
     
     if teacher_model is not None:
         teacher_model.eval()
@@ -141,12 +149,12 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
     max_accuracy = 0.0
     for epoch in range(args.epochs):
         # Set only target part in training mode
-        model.eval()
+        actual_model.eval()
         for blk in args.replace:
             if stage == "attn":
-                model.blocks[blk].attn.train()
+                actual_model.blocks[blk].attn.train()
             elif stage in ["block", "global"]:
-                model.blocks[blk].train()
+                actual_model.blocks[blk].train()
             else:
                 raise ValueError("Invalid training stage (attn/block/global).") 
             
@@ -160,14 +168,14 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
         
         # Save checkpoint model
         model_dict = {
-            'model': model.state_dict(),
+            'model': actual_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
             'epoch': epoch,
             'scaler': loss_scaler.state_dict(),
             'args': args,
             }
-        if epoch%10 == 0:
+        if utils.get_rank() == 0 and epoch%10 == 0:
             torch.save(model_dict, checkpoint_path)
         
         # Evaluate training
@@ -178,8 +186,10 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
         # Save best checkpoint
         if max_accuracy < test_stats_class["acc1"]:
             max_accuracy = test_stats_class["acc1"]
-            torch.save(model_dict, best_checkpoint_path)
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+            if utils.get_rank() == 0:
+                torch.save(model_dict, best_checkpoint_path)
+        if utils.get_rank() == 0:
+            print(f'Max accuracy: {max_accuracy:.2f}%')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats_class.items()},
@@ -187,15 +197,17 @@ def train_model(args, stage, loss_mode, model, teacher_model, train_data, test_d
                      'n_parameters': n_parameters}
         if loss_mode in ["similarity", "combine"]:
             log_stats.update({f'test_cosine_{k}': v for k, v in test_stats_cosine.items()})
-        with (args.output_dir / "log.txt").open("a") as f:
+        if utils.get_rank() == 0:
+            with (args.output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f"{stage} finished.")
-    print('Training time {}'.format(total_time_str))
-    with (args.output_dir / "log.txt").open("a") as f:
-        f.write("Training time:" + json.dumps(total_time_str) + "\n")
+    if utils.get_rank() == 0:
+        print(f"{stage} finished.")
+        print('Training time {}'.format(total_time_str))
+        with (args.output_dir / "log.txt").open("a") as f:
+            f.write("Training time:" + json.dumps(total_time_str) + "\n")
             
     return model, model_dict
 
