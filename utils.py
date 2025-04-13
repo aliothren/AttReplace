@@ -1,18 +1,13 @@
-# Copyright (c) 2015-present, Facebook, Inc.
-# All rights reserved.
-"""
-Misc functions, including distributed helpers.
-
-Mostly copy-paste from torchvision references.
-"""
 import io
 import os
+import re
 import time
-from collections import defaultdict, deque
-import datetime
-
 import torch
+import datetime
+import numpy as np
+import matplotlib.pyplot as plt
 import torch.distributed as dist
+from collections import defaultdict, deque
 
 
 class SmoothedValue(object):
@@ -227,6 +222,7 @@ def init_distributed_mode(args):
         return
 
     args.distributed = True
+    print(f"Using distributed mode, rank={args.rank}, GPU={args.gpu}")
 
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
@@ -236,3 +232,112 @@ def init_distributed_mode(args):
                                          world_size=args.world_size, rank=args.rank)
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
+
+
+def save_train_fig(save_path, epoch, acc, curves, valid, step, mode):
+    
+    # evaluate on validation set
+    valid[epoch, 0] = epoch
+    valid[epoch, 1], valid[epoch, 2] = acc
+    
+    # plot training curve
+    np.savetxt(save_path / f'curves_{mode}.dat', curves)
+    
+    clr1 = (0.5, 0., 0.)
+    clr2 = (0.0, 0.5, 0.)
+    fig, ax1 = plt.subplots()
+    fig2, ax3 = plt.subplots()
+    ax2 = ax1.twinx()
+    ax4 = ax3.twinx()
+    ax1.set_xlabel('steps')
+    ax1.set_ylabel('Loss', color=clr1)
+    ax1.tick_params(axis='y', colors=clr1)
+    ax2.set_ylabel('Total loss', color=clr2)
+    ax2.tick_params(axis='y', colors=clr2)
+    
+    ax3.set_xlabel('steps')
+    ax3.set_ylabel('Sparsity', color=clr1)
+    ax3.tick_params(axis='y', colors=clr1)
+    ax4.set_ylabel('Reg', color=clr2)
+    #ax4.yscale('log')
+    ax4.tick_params(axis='y', colors=clr2)
+    
+    start = 0
+    end = step
+    markersize = 12
+    coef = 2.
+    ax1.plot(curves[start:end, 0], curves[start:end, 1], '--', color=[c*coef for c in clr1], markersize=markersize)
+    ax2.plot(curves[start:end, 0], curves[start:end, 6], '-', color=[c*coef for c in clr2], markersize=markersize)
+    ax3.plot(curves[start:end, 0], curves[start:end, 3], '--', color=[c*1. for c in clr1], markersize=markersize)
+    ax3.plot(curves[start:end, 0], curves[start:end, 4], '-', color=[c*1.5 for c in clr1], markersize=markersize)
+    ax3.plot(curves[start:end, 0], curves[start:end, 5], '-', color=[c*2. for c in clr1], markersize=markersize)
+    ax4.plot(curves[start:end, 0], curves[start:end, 2], '-', color=[c*coef for c in clr2], markersize=markersize)
+    
+    #ax2.set_ylim(bottom=20, top=100)
+    ax1.legend(('Train loss'), loc='lower right')
+    ax2.legend(('Total loss'), loc='lower left')
+    fig.savefig(save_path / f'loss-vs-steps_{mode}.png')
+    
+    #ax4.set_ylim(bottom=20, top=100)
+    ax3.legend(('Elt_sparsity','Filter_sparsity','Average_sparsity'), loc='lower right')
+    ax4.legend(('Reg'), loc='lower left')
+    fig2.savefig(save_path / f'sparsity-vs-steps_{mode}.png')
+    
+    # plot validation curve
+    np.savetxt(save_path / f'valid_{mode}.dat', valid)
+    
+    fig3, ax5 = plt.subplots()
+    ax6 = ax5.twinx()
+    ax5.set_xlabel('epochs')
+    ax5.set_ylabel('Acc@1', color=clr1)
+    ax5.tick_params(axis='y', colors=clr1)
+    ax6.set_ylabel('Acc@5', color=clr2)
+    ax6.tick_params(axis='y', colors=clr2)
+    
+    start = 0
+    end = epoch+1
+    markersize = 12
+    coef = 2.
+    ax5.plot(valid[start:end, 0], valid[start:end, 1], '--', color=[c*coef for c in clr1], markersize=markersize)
+    ax6.plot(valid[start:end, 0], valid[start:end, 2], '-', color=[c*coef for c in clr2], markersize=markersize)
+    
+    #ax2.set_ylim(bottom=20, top=100)
+    ax5.legend(('Acc@1'), loc='lower right')
+    ax6.legend(('Acc@5'), loc='lower left')
+    fig3.savefig(save_path / f'accuracy-vs-epochs_{mode}.png')
+    plt.close(fig)
+    plt.close(fig2)
+    plt.close(fig3)
+
+    
+def print_nonzeros(model):
+    nonzero = total = 0
+    for name, p in model.named_parameters():
+        if 'weight' in name:
+            tensor = p.data.cpu().numpy()
+            nz_count = np.count_nonzero(tensor)
+            total_params = np.prod(tensor.shape)
+            nonzero += nz_count
+            total += total_params
+            print(f'{name:20} | nonzeros = {nz_count:7} / {total_params:7} ({100 * nz_count / total_params:6.2f}%) | total_pruned = {total_params - nz_count :7} | shape = {tensor.shape}')
+        if 'weight' in name:
+            tensor = np.abs(tensor)
+            if "proj" in name:
+                dim = np.sum(tensor, axis=0)  # 按列统计
+                label = "col"
+            elif '_ih_l' in name or '_hh_l' in name:
+                match = re.search(r'_l(\d+)(?:_reverse)?', name)
+                if match:
+                    layer_idx = int(match.group(1))
+                    if layer_idx % 2 == 0:
+                        dim = np.sum(tensor, axis=0)  # 偶数层按列
+                        label = 'col'
+                    else:
+                        dim = np.sum(tensor, axis=1)  # 奇数层按行
+                        label = 'row'
+            
+            nz_dim = np.count_nonzero(dim)
+            print(f'{"":35} | {label}_active = {nz_dim:5d} / {len(dim):5d} '
+                  f'({100 * nz_dim / len(dim):6.2f}%)')    
+
+    print(f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned)')

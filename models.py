@@ -21,9 +21,9 @@ param_dict_mixer = {
 param_dict_lstm = {
     "DeiT-Tiny":{
         "input_dim": 192,
-        "hidden_dim": 64,
+        "hidden_dim": 128,
         "output_dim": 192,
-        "num_layers": 2,
+        "num_layers": 1,
     },
     "DeiT-Small":{
         "input_dim": 384,
@@ -175,10 +175,39 @@ def replace_attention(model, repl_blocks, target = None, model_name = ""):
 
 
 def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "attn", trainable=True):
+    if model == None:
+        print("Model is None, cannot set trainable parts.")
+        return
+    
     target_names = [f"blocks.{block}." for block in target_blocks]
     print("Trainable Params:")
     # Global fintune when transfer to downstream datasets
     if mode == "downstream":
+        if target_part == "full":
+            for name, param in model.named_parameters():
+                param.requires_grad = trainable
+        elif target_part == "FC":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    if "mlp" in name:
+                        param.requires_grad = trainable
+                        print(name)
+            for name, param in model.head.named_parameters():
+                param.requires_grad = True
+                print(name)
+        elif target_part == "FC+head":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    if "mlp" in name or "proj" in name:
+                        param.requires_grad = trainable
+                        print(name)
+            for name, param in model.head.named_parameters():
+                param.requires_grad = True
+                print(name)
+        
+    elif mode == "prune":
         for name, param in model.named_parameters():
             param.requires_grad = trainable
     
@@ -222,6 +251,16 @@ def set_requires_grad(model, mode = "train", target_blocks = [], target_part = "
                     if "attn" in name and "teacher" not in name:
                         param.requires_grad = trainable
                         print(name)
+        elif target_part == "FC+head":
+            for name, param in model.named_parameters():
+                param.requires_grad = not trainable
+                if any(target in name for target in target_names):
+                    if "mlp" in name:
+                        param.requires_grad = trainable
+                        print(name)
+            for name, param in model.module.head.named_parameters():
+                param.requires_grad = True
+                print(name)
                         
     else:
         raise NotImplementedError("Not available set_requires_grad mode (train/finetune/downstream)")  

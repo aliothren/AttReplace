@@ -1,7 +1,10 @@
 import gc
 import copy
+import json
 import torch
 import fcntl
+import utils
+import random
 import models
 import datetime
 import argparse
@@ -47,6 +50,9 @@ PRETRAINED_PATH = {
     "Small": "https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth",
     "Base": "https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
     }
+ATTN_PATH = {
+    "Tiny": "/home/yuxinr/AttnDistill/models/2025-03-17-23-15-18/model_seq0.pth",
+}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BASE_DIR = "/home/yuxinr/AttnDistill/"
 
@@ -79,13 +85,16 @@ def get_args_parser():
     # Transformer (DeiT) model setups
     parser.add_argument("--base-model", default="DeiT-Tiny", choices=["DeiT-Tiny", "DeiT-Small", "DeiT-Base"],
                         type=str, metavar="MODEL")
-    parser.add_argument("--pretrained", default="Tiny", choices=["Tiny", "Small", "Base"],
+    parser.add_argument("--scale", default="Tiny", choices=["Tiny", "Small", "Base"],
                         type=str, metavar="MODEL")
     parser.add_argument("--input-size", default=224, type=int, help="expected images size for model input")
     parser.add_argument("--base-weight", default="", help="path of base model checkpoint")
+    parser.add_argument("--attn-weight", default="", help="path of attn part pretrained replace structure")
     
     # data parameters
     parser.add_argument("--dataset", default="IMNET", type=str, 
+                        choices=["IMNET", "CIFAR10", "CIFAR100", "INAT18", "INAT19", "FLOWER", "CAR"])
+    parser.add_argument("--ft-dataset", default="IMNET", type=str, 
                         choices=["IMNET", "CIFAR10", "CIFAR100", "INAT18", "INAT19", "FLOWER", "CAR"])
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -101,15 +110,17 @@ def get_args_parser():
     
     # Training setups
     parser.add_argument("--train-mode", default="parallel", choices=["parallel", "sequential"])
-    parser.add_argument("--step", default=3, type=int, help="Step length when sequentially replace blocks and training")
+    parser.add_argument("--step", default=12, type=int, help="Step length when sequentially replace blocks and training")
     parser.add_argument("--interm-model", default="", type=str, help="Path of intermediate model in sequential training")
     parser.add_argument("--replace", type=parse_replace, help="List of indices or range of blocks to replace")
     parser.add_argument("--rep-by", default="lstm", choices=["mixer", "lstm"], 
                         help="Structure used to replace attention")
+    parser.add_argument("--skip-train-attn", action='store_true', 
+                        help="Use pretrained attn part instead of train from scratch")
     parser.add_argument("--block-ft", action='store_true', 
                         help="Block-level finetune the replaced blocks after training attention")
     parser.set_defaults(block_ft=True)
-    parser.add_argument("--train-loss", default="similarity", choices=["similarity", "classification", "combine"],
+    parser.add_argument("--train-loss", default="combine", choices=["similarity", "classification", "combine"],
                         type=str, help="Criterion using in training")
     
     # Training parameters
@@ -126,7 +137,7 @@ def get_args_parser():
                         help='Clip gradient norm (default: None, no clipping)')
     
     parser.add_argument("--batch-size", default=256, type=int)
-    parser.add_argument("--epochs", default=30, type=int, help="Training epochs")
+    parser.add_argument("--epochs", default=200, type=int, help="Training epochs")
     parser.add_argument("--lr", type=float, default=5e-4, metavar='LR', help='Replaced attention learning rate')
     parser.add_argument('--unscale-lr', action='store_true', help="Not scale lr according to batch size")
     parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
@@ -134,19 +145,19 @@ def get_args_parser():
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')    
     
-    parser.add_argument("--block-ft-mode", default="block", choices=["block", "FC"],
+    parser.add_argument("--block-ft-mode", default="block", choices=["block", "FC", "FC+head"],
                         type=str, help="Finetune scope in blockwise training")
-    parser.add_argument("--block-ft-train-loss", default="similarity", choices=["similarity", "classification", "combine"],
-                        type=str, help="Criterion using in training")
+    parser.add_argument("--block-ft-train-loss", default="classification", choices=["classification", "combine"],
+                        type=str, help="Criterion using in blockwise training")
     parser.add_argument("--block-ft-batch-size", default=256, type=int, help="Batch size when block-level finetuning")
-    parser.add_argument("--block-ft-epochs", default=30, type=int, help="Training epochs when block-level finetuning")
-    parser.add_argument("--block-ft-lr", type=float, default=5e-4, metavar='LR', 
+    parser.add_argument("--block-ft-epochs", default=100, type=int, help="Training epochs when block-level finetuning")
+    parser.add_argument("--block-ft-lr", type=float, default=5e-5, metavar='LR', 
                         help='Learning rate when block-level finetuning')
     parser.add_argument('--block-ft-unscale-lr', action='store_true',
                         help="Not scale lr according to batch size when block-level finetuning")
     parser.add_argument('--block-ft-warmup-epochs', type=int, default=5, 
                         help='Number of warmup epochs when block-level finetuning')
-    parser.add_argument('--block-ft-warmup-lr', type=float, default=1e-5,
+    parser.add_argument('--block-ft-warmup-lr', type=float, default=1e-6,
                         help='Warm-up initial learning rate when block-level finetuning')
     parser.add_argument('--block-ft-sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler when block-level finetuning (default: "cosine")')
@@ -156,6 +167,9 @@ def get_args_parser():
     
     # Evaluation setups
     parser.add_argument("--eval-model", default="", help="Path of model to be evaluated")
+    
+    # Downstream setups
+    parser.add_argument("--ds-mode", default="all", choices=["full", "FC", "FC+head"])
     
     # Finetuning setups
     parser.add_argument("--ft-mode", default="head", choices=["head", "sequential"])
@@ -185,12 +199,21 @@ def get_args_parser():
     parser.add_argument('--train-interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
     parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
+    parser.add_argument("--repeated-aug", action="store_true", help="used in distributed training")
+    parser.add_argument("--no-repeated-aug", action="store_false", dest="repeated_aug")
+    parser.set_defaults(repeated_aug=True)
     
     # Random Erase params
     parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT', help='Random erase prob (default: 0.25)')
     parser.add_argument('--remode', type=str, default='pixel', help='Random erase mode (default: "pixel")')
     parser.add_argument('--recount', type=int, default=1, help='Random erase count (default: 1)')
 
+    # distributed training parameters
+    parser.add_argument('--distributed', action='store_true', default=False, help='Enabling distributed training')
+    parser.add_argument('--world_size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    
     return parser
     
 
@@ -230,12 +253,11 @@ def concat_model(base_model, name_list, idx_list):
 
 
 def evaluate(args):
-    print(args)
     print(f"Running in eval mode, args.mode: {args.mode}")
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
@@ -257,16 +279,16 @@ def evaluate(args):
 
 
 def train(args, seq=0):
-    print(args)
     print(f"Running in train mode, args.mode: {args.mode}")
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
     cudnn.benchmark = True
+    print(f"Using seed: {seed}")
 
     data_loader_train = load_dataset(args, "train")
     data_loader_val, _ = load_dataset(args, "val")
@@ -276,75 +298,110 @@ def train(args, seq=0):
     model_name = MODEL_PATH[args.base_model]["name"]
     if args.base_weight == "":
         model_weight = MODEL_PATH[args.base_model]["weight"]
+        print("Using default model weight.")
     else:
         model_weight = args.base_weight
+    print(f"Using weight file {model_weight}")
     base_model = create_model(
         model_name=model_name, pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop,
         drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size
         )
     base_model = models.load_weight(base_model, model_weight)
     base_model.to(args.device)
-    # Load and modify teacher model
-    teacher_model = copy.deepcopy(base_model)
-    teacher_model.to(args.device)
-    teacher_model = models.replace_attention(
-        model=teacher_model, repl_blocks=args.replace, target="attn", 
-        model_name=args.base_model
-    )
-    # Load and modify student model
+    
+    # Set unique output directory
     if seq == 0:
-        student_model = models.replace_attention(
-            model=base_model, repl_blocks=args.replace, target=args.rep_by, 
+        args.output_dir = get_unique_output_dir(args.base_dir)
+        
+    # Load and modify teacher model
+    if args.train_loss == "classification" and args.block_ft_train_loss == "classification":
+        teacher_model = None
+    else:
+        teacher_model = copy.deepcopy(base_model)
+        teacher_model.to(args.device)
+        teacher_model = models.replace_attention(
+            model=teacher_model, repl_blocks=args.replace, target="attn", 
             model_name=args.base_model
         )
+    
+    # Load and modify student model
+    if seq == 0:
+        if args.skip_train_attn:
+            if args.attn_weight == "":
+                student_weight = ATTN_PATH[args.scale]
+                print("Using default attention pretrained weight.")
+            else:
+                student_weight = args.attn_weight
+            student_model = torch.load(student_weight)
+        else:        
+            student_model = models.replace_attention(
+                model=base_model, repl_blocks=args.replace, target=args.rep_by, 
+                model_name=args.base_model
+            )
     else:
         student_model = torch.load(args.interm_model)
         student_model = models.replace_attention(
             model=student_model, repl_blocks=args.replace, target=args.rep_by, 
             model_name=args.base_model
         )
+    student_model.to(args.device)
+    student_model_without_ddp = student_model
+    if args.distributed:
+        student_model = torch.nn.parallel.DistributedDataParallel(
+            student_model, device_ids=[args.gpu], find_unused_parameters=True)
+        student_model_without_ddp = student_model.module
+        
+    # Train attention part
+    if not args.skip_train_attn:
+        # Set trainable parameters
+        print(f"Set teacher_model to trainable, blocks [], part attn")
+        models.set_requires_grad(teacher_model, "train", [], "attn") # No trainable param in teacher
+        print(f"Set student_model to trainable, blocks {args.replace}, part attn")
+        models.set_requires_grad(student_model, "train", args.replace, "attn") # Target attn part trainable
+        n_parameters = sum(p.numel() for p in student_model.parameters() if p.requires_grad)
+        print(f"number of trainable params: {n_parameters}")
     
-    # Set trainable parameters
-    models.set_requires_grad(teacher_model, "train", [], "attn") # No trainable param in teacher
-    models.set_requires_grad(student_model, "train", args.replace, "attn") # Target attn part trainable
-    n_parameters = sum(p.numel() for p in student_model.parameters() if p.requires_grad)
-    print(f"number of trainable params: {n_parameters}")
-    
-    # Set unique output directory
-    if seq == 0:
-        args.output_dir = get_unique_output_dir(args.base_dir)
-    
-    # Set training configurations
-    if not args.unscale_lr:
-        linear_scaled_lr = args.lr * args.batch_size / 512.0
-        args.lr = linear_scaled_lr
-    optimizer = create_optimizer(args, student_model)
-    loss_scaler = NativeScaler()
-    lr_scheduler, _ = create_scheduler(args, optimizer)
-    
-    # Train model
-    trained_model, trained_model_dict = train_model(
-        args=args, stage="attn", loss_mode=args.train_loss,
-        model=student_model, teacher_model=teacher_model,
-        train_data=data_loader_train, test_data=data_loader_val,
-        optimizer=optimizer, loss_scaler=loss_scaler, 
-        lr_scheduler=lr_scheduler, n_parameters=n_parameters
-        )
+        # Set training configurations
+        if not args.unscale_lr:
+            linear_scaled_lr = args.lr * args.batch_size / 512.0
+            args.lr = linear_scaled_lr
+        optimizer = create_optimizer(args, student_model_without_ddp)
+        loss_scaler = NativeScaler()
+        lr_scheduler, _ = create_scheduler(args, optimizer)
+
+        # Train model
+        trained_model, trained_model_dict = train_model(
+            args=args, stage="attn", loss_mode=args.train_loss,
+            model=student_model, teacher_model=teacher_model,
+            train_data=data_loader_train, test_data=data_loader_val,
+            optimizer=optimizer, loss_scaler=loss_scaler, 
+            lr_scheduler=lr_scheduler, n_parameters=n_parameters
+            )
+        
+    else: 
+        trained_model = student_model
     
     # Save model
-    save_path = args.output_dir / f"model_seq{seq}.pth"
-    torch.save(trained_model, save_path)
-    args.interm_model = save_path
+    if utils.get_rank() == 0:
+        save_path = args.output_dir / f"model_seq{seq}.pth"
+        if hasattr(trained_model, 'module'):
+            torch.save(trained_model.module, save_path)
+        else:
+            torch.save(trained_model, save_path)
+        args.interm_model = save_path
     
     if args.block_ft:
         print(f"Doing block-level finetuning of attention-trained model...")
+        
+        if args.dataset != args.ft_dataset:
+            args.dataset = args.ft_dataset
+            data_loader_train = load_dataset(args, "train")
+            data_loader_val, _ = load_dataset(args, "val")
         # Continue training on trained_model
-        if args.block_ft_mode == "block":
-            models.set_requires_grad(trained_model, "train", args.replace, "block") # Target blocks trainable
-            models.set_requires_grad(teacher_model, "train", [], "block") # No parameter trainable in teacher
-        else:
-            models.set_requires_grad(trained_model, "train", args.replace, "FC") # FC layers in target blocks trainable
-            models.set_requires_grad(teacher_model, "train", [], "FC") # No parameter trainable in teacher
+        print(f"Set trained_model to trainable, blocks {args.replace}, part {args.block_ft_mode}")
+        models.set_requires_grad(trained_model, "train", args.replace, args.block_ft_mode) # Target part trainable
+        print(f"Set teacher_model to trainable, blocks [], part {args.block_ft_mode}")
+        models.set_requires_grad(teacher_model, "train", [], args.block_ft_mode) # Not trainable
             
         n_parameters = sum(p.numel() for p in trained_model.parameters() if p.requires_grad)
         print(f"number of trainable params: {n_parameters}")
@@ -359,8 +416,12 @@ def train(args, seq=0):
         args.warmup_epochs = args.block_ft_warmup_epochs
         args.warmup_lr = args.block_ft_warmup_lr
         args.sched = args.block_ft_sched
+        
         # Set training configurations
-        optimizer = create_optimizer(args, trained_model)
+        trained_model_without_ddp = trained_model
+        if args.distributed:
+            trained_model_without_ddp = trained_model.module
+        optimizer = create_optimizer(args, trained_model_without_ddp)
         loss_scaler = NativeScaler()
         lr_scheduler, _ = create_scheduler(args, optimizer)
         
@@ -374,9 +435,13 @@ def train(args, seq=0):
             )
         
         # Save finetuned model
-        save_path = args.output_dir / f"model_block_seq{seq}.pth"
-        torch.save(fted_model, save_path)
-        args.interm_model = save_path
+        if utils.get_rank() == 0:
+            save_path = args.output_dir / f"model_block_seq{seq}.pth"
+            if hasattr(fted_model, 'module'):
+                torch.save(fted_model.module, save_path)
+            else:
+                torch.save(fted_model, save_path)
+            args.interm_model = save_path
         
         del optimizer, fted_model, teacher_model, data_loader_train, data_loader_val
         gc.collect()
@@ -385,17 +450,16 @@ def train(args, seq=0):
 
 def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
     args.replace = target_blocks
-    print(args)
     print(f"Running in finetune mode, args.mode: {args.mode}")
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
-    # seed = args.seed + utils.get_rank()
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
     cudnn.benchmark = True
+    print(f"Using seed: {seed}")
 
     data_loader_train = load_dataset(args, "train")
     data_loader_val, _ = load_dataset(args, "val")
@@ -452,10 +516,16 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
         
     else:
         raise ValueError("Invalid ft_mode (sequential/head).") 
+            
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True
+            )
+        model_without_ddp = model.module
     
     models.set_requires_grad(model, "finetune", args.replace, ft_mode) # head trainable
-    if teacher_model != None:
-        models.set_requires_grad(teacher_model, "finetune", [], ft_mode) # No trainable param in teacher
+    models.set_requires_grad(teacher_model, "finetune", [], ft_mode) # No trainable param in teacher
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"number of trainable params: {n_parameters}")
     
@@ -474,7 +544,7 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
     args.warmup_lr = args.ft_warmup_lr
     args.sched = args.ft_sched
     # Set training configurations
-    optimizer = create_optimizer(args, model)
+    optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
     
@@ -490,22 +560,25 @@ def finetune(args, seq=0, ft_mode="head", name_list=[], target_blocks = []):
         save_path = args.output_dir / f"model_ft_head.pth"
     else:
         save_path = args.output_dir / f"model_ft_seq{seq}.pth"
-    torch.save(fted_model, save_path)
-    args.interm_model = save_path
+    if utils.get_rank() == 0:
+        if hasattr(fted_model, 'module'):
+            torch.save(fted_model.module, save_path)
+        else:
+            torch.save(fted_model, save_path)
+        args.interm_model = save_path
 
 
 def downstream(args, pretrained_path):
-    print(args)
     print(f"Running in downstream mode, args.mode: {args.mode}")
     print(f"Using device: {args.device}")
 
     # fix the seed for reproducibility
-    seed = args.seed
-    # seed = args.seed + utils.get_rank()
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
     cudnn.benchmark = True
+    print(f"Using seed: {seed}")
 
     data_loader_train = load_dataset(args, "train")
     data_loader_val, _ = load_dataset(args, "val")
@@ -514,14 +587,24 @@ def downstream(args, pretrained_path):
     print(f"Loading pretrained model: {pretrained_path} with class num {args.nb_classes}")
     model = models.load_downstream_model(pretrained_path, args)
     model.to(args.device)
-    models.set_requires_grad(model, "downstream") # whole model trainable
+    models.set_requires_grad(
+        model, mode="downstream", target_blocks=list(range(12)), target_part=args.ds_mode
+        )
+    
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True
+            )
+        model_without_ddp = model.module
+        
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"number of trainable params: {n_parameters}")
         
     args.output_dir = get_unique_output_dir(args.base_dir)
     
     # Set training configurations
-    optimizer = create_optimizer(args, model)
+    optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
     fted_model, fted_model_dict = train_model(
@@ -532,8 +615,12 @@ def downstream(args, pretrained_path):
         lr_scheduler=lr_scheduler, n_parameters=n_parameters
         )
     
-    save_path = args.output_dir / "model_ds.pth"
-    torch.save(fted_model, save_path)
+    if utils.get_rank() == 0:
+        save_path = args.output_dir / "model_ds.pth"
+        if hasattr(fted_model, 'module'):
+            torch.save(fted_model.module, save_path)
+        else:
+            torch.save(fted_model, save_path)
     
 
 def eval_trained_models(args, seq=0):
@@ -553,6 +640,8 @@ def eval_trained_models(args, seq=0):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("DeiT -> MLP Mixer", parents=[get_args_parser()])
     args = parser.parse_args()
+    print(json.dumps({k: str(v) for k, v in vars(args).items()}, indent=4))
+    utils.init_distributed_mode(args)
     
     if args.data_path is None:
         args.data_path = DATA_PATH[args.dataset]
@@ -639,7 +728,7 @@ if __name__ == '__main__':
             raise ValueError("Invalid ft_mode (sequential/head).")  
              
     elif args.mode == "downstream": 
-        pretrained_path = PRETRAINED_PATH[args.pretrained]
+        pretrained_path = PRETRAINED_PATH[args.scale]
         args.replace = list(range(12))
         downstream(args, pretrained_path)
            
